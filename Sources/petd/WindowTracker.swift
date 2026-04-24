@@ -38,6 +38,14 @@ final class WindowTracker {
         return err == .success ? id : nil
     }
 
+    /// Current AX frame of the tracked terminal window, queried on demand.
+    /// Used by the frame-sync poll to keep the pet locked to the window
+    /// during live drags (AX move notifications alone are throttled).
+    var currentTerminalFrame: CGRect? {
+        guard let trackedWindow else { return nil }
+        return Self.frame(of: trackedWindow)
+    }
+
     func start() {
         guard ensureAccessibilityPermission() else {
             NSLog("cliPets: Accessibility permission not granted. Open System Settings > Privacy & Security > Accessibility and enable the petd binary. Re-run petd after granting.")

@@ -6,9 +6,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
     private var spriteLayer: CALayer?
     private var timer: Timer?
+    private var syncTimer: Timer?
     private var tickCount: Int = 0
     private var frames: [CGImage] = []
     private var tracker: WindowTracker?
+    private var lastTerminalFrame: CGRect?
 
     // 32px sprite rendered at 1.5x nearest-neighbor. Phase 7 will swap to
     // proper sprite sheets at integer scales for crisp pixels.
@@ -21,11 +23,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildSpriteFrames()
         startAnimationTimer()
         startWindowTracker()
+        startFrameSyncTimer()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         tracker?.stop()
         timer?.invalidate()
+        syncTimer?.invalidate()
     }
 
     // MARK: - Overlay window
@@ -106,12 +110,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // both terminal and pet.
             self?.orderPetAboveTerminal()
         }
-        t.start()
+        // Must be set before start(): start() fires onFrameChange synchronously,
+        // and the callback needs tracker.trackedWindowID to anchor on first spawn.
         self.tracker = t
+        t.start()
     }
 
+    /// Called by the AX observer on move/resize and by the activation hook.
+    /// Updates frame AND re-anchors Z-order.
     private func reposition(terminalAxFrame: CGRect) {
+        applyFrame(from: terminalAxFrame, displayNow: true)
+        orderPetAboveTerminal()
+    }
+
+    /// Called by the 60Hz sync timer. Only updates the frame; Z-order is
+    /// stable between focus changes so we skip the order() call to avoid
+    /// hammering the window server at display rate.
+    private func syncFrameFromTerminal() {
+        guard let axFrame = tracker?.currentTerminalFrame else { return }
+        applyFrame(from: axFrame, displayNow: false)
+    }
+
+    private func applyFrame(from terminalAxFrame: CGRect, displayNow: Bool) {
         guard let window else { return }
+        if terminalAxFrame == lastTerminalFrame { return }
+        lastTerminalFrame = terminalAxFrame
         let terminalNS = Self.nsRect(fromAX: terminalAxFrame)
         // Top-right of the terminal. Paws dip `petOverlap` below the top edge
         // so it looks like the pet is hanging on by its paws.
@@ -121,8 +144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             width: petSize,
             height: petSize
         )
-        window.setFrame(petFrame, display: true)
-        orderPetAboveTerminal()
+        window.setFrame(petFrame, display: displayNow)
     }
 
     /// Pin the pet exactly one layer above the tracked terminal window in
@@ -131,10 +153,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// both terminal and pet end up behind it.
     private func orderPetAboveTerminal() {
         guard let window else { return }
+        // Ensure the window is on screen first. order(.above, relativeTo:)
+        // is supposed to bring an offscreen window in, but on a borderless
+        // window owned by an .accessory-policy app it sometimes doesn't —
+        // which manifested as the pet not rendering until the user clicked
+        // the terminal.
+        if !window.isVisible {
+            window.orderFront(nil)
+        }
         if let wid = tracker?.trackedWindowID {
             window.order(.above, relativeTo: Int(wid))
-        } else {
-            window.orderFront(nil)
+        }
+    }
+
+    private func startFrameSyncTimer() {
+        // 60Hz poll of the terminal's AX frame. AX move/resize notifications
+        // alone are coalesced and produce visible lag during live drags; this
+        // keeps the pet locked to the window frame-for-frame.
+        syncTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.syncFrameFromTerminal()
+            }
         }
     }
 
