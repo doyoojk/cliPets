@@ -1,6 +1,12 @@
 import AppKit
 @preconcurrency import ApplicationServices
 
+// Private but stable-for-years AX SPI used by Rectangle, yabai, etc. Returns
+// the CGWindowID for an AXUIElement so we can Z-order cross-app windows
+// with NSWindow.orderWindow(.above, relativeTo:).
+@_silgen_name("_AXUIElementGetWindow")
+private func _AXUIElementGetWindow(_ element: AXUIElement, _ windowId: UnsafeMutablePointer<CGWindowID>) -> AXError
+
 /// Finds the frontmost supported terminal window, pins an overlay to it,
 /// and keeps the overlay in sync with move/resize/close events via AXObserver.
 ///
@@ -23,6 +29,14 @@ final class WindowTracker {
     private var trackedPid: pid_t?
     private var quitObserver: NSObjectProtocol?
     private var activationObserver: NSObjectProtocol?
+
+    /// CGWindowID of the tracked terminal window, for cross-app Z-ordering.
+    var trackedWindowID: CGWindowID? {
+        guard let trackedWindow else { return nil }
+        var id: CGWindowID = 0
+        let err = _AXUIElementGetWindow(trackedWindow, &id)
+        return err == .success ? id : nil
+    }
 
     func start() {
         guard ensureAccessibilityPermission() else {

@@ -12,9 +12,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // 32px sprite rendered at 1.5x nearest-neighbor. Phase 7 will swap to
     // proper sprite sheets at integer scales for crisp pixels.
-    private let petSize: CGFloat = 48
-    private let petInset: CGFloat = 12     // inset from terminal's right edge
-    private let petOverlap: CGFloat = 6    // how far the paws dip below the terminal's top edge
+    private let petSize: CGFloat = 70
+    private let petInset: CGFloat = 60     // inset from terminal's right edge
+    private let petOverlap: CGFloat = 20    // how far the paws dip below the terminal's top edge
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildOverlayWindow()
@@ -101,9 +101,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.window?.orderOut(nil)
         }
         t.onTerminalActivated = { [weak self] in
-            // Pull pet back above newly-focused siblings when the terminal
-            // is brought forward, so visibility rides with the terminal.
-            self?.window?.orderFront(nil)
+            // Terminal just became frontmost — re-anchor the pet one layer
+            // above it. Any third window placed above the terminal covers
+            // both terminal and pet.
+            self?.orderPetAboveTerminal()
         }
         t.start()
         self.tracker = t
@@ -121,7 +122,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             height: petSize
         )
         window.setFrame(petFrame, display: true)
-        window.orderFront(nil)
+        orderPetAboveTerminal()
+    }
+
+    /// Pin the pet exactly one layer above the tracked terminal window in
+    /// global Z-order. Unlike orderFront(), this does not raise the pet above
+    /// unrelated windows — if a third window is raised above the terminal,
+    /// both terminal and pet end up behind it.
+    private func orderPetAboveTerminal() {
+        guard let window else { return }
+        if let wid = tracker?.trackedWindowID {
+            window.order(.above, relativeTo: Int(wid))
+        } else {
+            window.orderFront(nil)
+        }
     }
 
     /// Converts an AX rect (top-left origin, Y downward, relative to primary display)
