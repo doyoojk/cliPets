@@ -11,8 +11,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var frames: [CGImage] = []
     private var tracker: WindowTracker?
     private var lastTerminalFrame: CGRect?
-    private var missionControlObserver: NSObjectProtocol?
-    private var hiddenForSystemGesture = false
 
     // 32px sprite rendered at 1.5x nearest-neighbor. Phase 7 will swap to
     // proper sprite sheets at integer scales for crisp pixels.
@@ -26,16 +24,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startAnimationTimer()
         startWindowTracker()
         startFrameSyncTimer()
-        startMissionControlObserver()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         tracker?.stop()
         timer?.invalidate()
         syncTimer?.invalidate()
-        if let missionControlObserver {
-            NSWorkspace.shared.notificationCenter.removeObserver(missionControlObserver)
-        }
     }
 
     // MARK: - Overlay window
@@ -54,7 +48,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // the terminal. We keep it ordered above the terminal via orderFront()
         // whenever the terminal is moved/resized/activated.
         w.level = .normal
-        w.collectionBehavior = [.stationary, .ignoresCycle]
+        // .transient: "hidden by Exposé and application hide" — keeps the pet
+        // out of Mission Control / Exposé / App Exposé thumbnail overlays.
+        // Do NOT add .stationary; it has the opposite effect ("unaffected by
+        // Exposé, stays visible").
+        w.collectionBehavior = [.transient, .ignoresCycle]
         w.ignoresMouseEvents = true
         w.hasShadow = false
 
@@ -180,36 +178,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             MainActor.assumeIsolated {
                 self?.syncFrameFromTerminal()
             }
-        }
-    }
-
-    /// Hide the pet when Mission Control / Exposé / Spaces are invoked, and
-    /// show it again when the gesture ends. macOS has no direct public API
-    /// for these system gestures, but Dock.app becomes the frontmost
-    /// application while they're active — we key off that.
-    private func startMissionControlObserver() {
-        let center = NSWorkspace.shared.notificationCenter
-        missionControlObserver = center.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] note in
-            guard
-                let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-            else { return }
-            MainActor.assumeIsolated {
-                self?.handleActivation(of: app)
-            }
-        }
-    }
-
-    private func handleActivation(of app: NSRunningApplication) {
-        if app.bundleIdentifier == "com.apple.dock" {
-            window?.orderOut(nil)
-            hiddenForSystemGesture = true
-        } else if hiddenForSystemGesture {
-            hiddenForSystemGesture = false
-            orderPetAboveTerminal()
         }
     }
 
