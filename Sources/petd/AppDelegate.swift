@@ -1,4 +1,5 @@
 import AppKit
+import CoreVideo
 import QuartzCore
 
 @MainActor
@@ -6,7 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
     private var spriteLayer: CALayer?
     private var timer: Timer?
-    private var syncTimer: Timer?
+    private var displayLink: CVDisplayLink?
     private var tickCount: Int = 0
     private var frames: [CGImage] = []
     private var tracker: WindowTracker?
@@ -23,13 +24,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildSpriteFrames()
         startAnimationTimer()
         startWindowTracker()
-        startFrameSyncTimer()
+        startFrameSync()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         tracker?.stop()
         timer?.invalidate()
-        syncTimer?.invalidate()
+        if let displayLink {
+            CVDisplayLinkStop(displayLink)
+        }
     }
 
     // MARK: - Overlay window
@@ -123,32 +126,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Called by the AX observer on move/resize and by the activation hook.
     /// Updates frame AND re-anchors Z-order.
     private func reposition(terminalAxFrame: CGRect) {
-        applyFrame(from: terminalAxFrame, displayNow: true)
+        applyFrame(fromTopLeftRect: terminalAxFrame)
         orderPetAboveTerminal()
     }
 
-    /// Called by the 60Hz sync timer. Only updates the frame; Z-order is
-    /// stable between focus changes so we skip the order() call to avoid
-    /// hammering the window server at display rate.
-    private func syncFrameFromTerminal() {
-        guard let axFrame = tracker?.currentTerminalFrame else { return }
-        applyFrame(from: axFrame, displayNow: false)
+    /// Called by the display link every vblank. Only updates the pet's origin;
+    /// Z-order is stable between focus changes so we skip the order() call to
+    /// avoid hammering the window server at display rate.
+    fileprivate func syncFrameFromTerminal() {
+        guard
+            let wid = tracker?.trackedWindowID,
+            let frame = Self.frameFromCGWindowList(windowID: wid)
+        else { return }
+        applyFrame(fromTopLeftRect: frame)
     }
 
-    private func applyFrame(from terminalAxFrame: CGRect, displayNow: Bool) {
+    private func applyFrame(fromTopLeftRect rect: CGRect) {
         guard let window else { return }
-        if terminalAxFrame == lastTerminalFrame { return }
-        lastTerminalFrame = terminalAxFrame
-        let terminalNS = Self.nsRect(fromAX: terminalAxFrame)
+        if rect == lastTerminalFrame { return }
+        lastTerminalFrame = rect
+        let terminalNS = Self.nsRect(fromAX: rect)
         // Top-right of the terminal. Paws dip `petOverlap` below the top edge
         // so it looks like the pet is hanging on by its paws.
-        let petFrame = NSRect(
+        let origin = NSPoint(
             x: terminalNS.maxX - petSize - petInset,
-            y: terminalNS.maxY - petOverlap,
-            width: petSize,
-            height: petSize
+            y: terminalNS.maxY - petOverlap
         )
-        window.setFrame(petFrame, display: displayNow)
+        // Pet's size never changes, so setFrameOrigin avoids the size-driven
+        // layout pass that setFrame triggers.
+        window.setFrameOrigin(origin)
+    }
+
+    /// Cheaper than AX for hot-loop polling: no IPC to the terminal app, just
+    /// a cached lookup against the Window Server's snapshot. Returns the
+    /// terminal's bounds in screen coordinates with origin at upper-left
+    /// (same orientation as AX).
+    private static func frameFromCGWindowList(windowID: CGWindowID) -> CGRect? {
+        let opts: CGWindowListOption = .optionIncludingWindow
+        guard
+            let info = CGWindowListCopyWindowInfo(opts, windowID) as? [[String: Any]],
+            let dict = info.first,
+            let boundsCF = dict[kCGWindowBounds as String] as CFTypeRef?
+        else { return nil }
+        var rect = CGRect.zero
+        guard CGRectMakeWithDictionaryRepresentation(boundsCF as! CFDictionary, &rect) else {
+            return nil
+        }
+        return rect
     }
 
     /// Pin the pet exactly one layer above the tracked terminal window in
@@ -170,15 +194,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func startFrameSyncTimer() {
-        // 60Hz poll of the terminal's AX frame. AX move/resize notifications
-        // alone are coalesced and produce visible lag during live drags; this
-        // keeps the pet locked to the window frame-for-frame.
-        syncTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.syncFrameFromTerminal()
-            }
+    private func startFrameSync() {
+        // CVDisplayLink phase-locks to the actual display refresh rate (120Hz
+        // on ProMotion, 60Hz otherwise). Better than a Timer because the
+        // callback fires near vblank, so our setFrame lands in the same
+        // compositor frame as the terminal's update — keeping the pet
+        // visually locked to the window during live drags.
+        var link: CVDisplayLink?
+        let err = CVDisplayLinkCreateWithActiveCGDisplays(&link)
+        guard err == kCVReturnSuccess, let link else {
+            NSLog("cliPets: CVDisplayLink unavailable (\(err)); pet position will be tracker-driven only")
+            return
         }
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        CVDisplayLinkSetOutputCallback(link, cliPetsDisplayLinkCallback, refcon)
+        CVDisplayLinkStart(link)
+        self.displayLink = link
     }
 
     /// Converts an AX rect (top-left origin, Y downward, relative to primary display)
@@ -192,4 +223,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             height: axRect.size.height
         )
     }
+}
+
+/// CVDisplayLink output callback. Runs on the CV thread; hops to main to
+/// touch AppKit. Captures AppDelegate via Unmanaged so we don't fight Swift's
+/// strict concurrency about C function pointers.
+private func cliPetsDisplayLinkCallback(
+    displayLink: CVDisplayLink,
+    inNow: UnsafePointer<CVTimeStamp>,
+    inOutputTime: UnsafePointer<CVTimeStamp>,
+    flagsIn: CVOptionFlags,
+    flagsOut: UnsafeMutablePointer<CVOptionFlags>,
+    refcon: UnsafeMutableRawPointer?
+) -> CVReturn {
+    guard let refcon else { return kCVReturnSuccess }
+    let appDelegate = Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue()
+    DispatchQueue.main.async {
+        MainActor.assumeIsolated {
+            appDelegate.syncFrameFromTerminal()
+        }
+    }
+    return kCVReturnSuccess
 }
