@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var frames: [CGImage] = []
     private var tracker: WindowTracker?
     private var lastTerminalFrame: CGRect?
+    private var eventServer: EventServer?
 
     // 32px sprite rendered at 1.5x nearest-neighbor. Phase 7 will swap to
     // proper sprite sheets at integer scales for crisp pixels.
@@ -25,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startAnimationTimer()
         startWindowTracker()
         startFrameSync()
+        startEventServer()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -33,6 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let displayLink {
             CVDisplayLinkStop(displayLink)
         }
+        eventServer?.stop()
     }
 
     // MARK: - Overlay window
@@ -192,6 +195,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let wid = tracker?.trackedWindowID {
             window.order(.above, relativeTo: Int(wid))
         }
+    }
+
+    private func startEventServer() {
+        let path = Self.defaultSocketPath()
+        let server = EventServer(socketPath: path)
+        server.start { event in
+            // Hops to main so AppKit work (animations in Phase 4+) is safe.
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    AppDelegate.handleHookEvent(event)
+                }
+            }
+        }
+        eventServer = server
+    }
+
+    /// Phase 3 sink: log received events. Phase 4 will route them through
+    /// the animation state machine.
+    private static func handleHookEvent(_ event: HookEvent) {
+        NSLog(
+            "cliPets: hook \(event.eventType) tool=\(event.toolName ?? "-") session=\(event.sessionId?.prefix(8) ?? "-") cwd=\(event.cwd ?? "-")"
+        )
+    }
+
+    static func defaultSocketPath() -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return "\(home)/.clipets/clipets.sock"
     }
 
     private func startFrameSync() {
