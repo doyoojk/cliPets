@@ -10,8 +10,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var frames: [CGImage] = []
     private var tracker: WindowTracker?
 
-    private let petSize: CGFloat = 128    // 32px sprite * 4x scale
-    private let petInset: CGFloat = 16    // inset from terminal window's left edge
+    // 32px sprite rendered at 1.5x nearest-neighbor. Phase 7 will swap to
+    // proper sprite sheets at integer scales for crisp pixels.
+    private let petSize: CGFloat = 48
+    private let petInset: CGFloat = 12     // inset from terminal's right edge
+    private let petOverlap: CGFloat = 6    // how far the paws dip below the terminal's top edge
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildOverlayWindow()
@@ -37,8 +40,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         w.isOpaque = false
         w.backgroundColor = .clear
-        w.level = .statusBar
-        w.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        // Normal level so the pet hides behind any window placed in front of
+        // the terminal. We keep it ordered above the terminal via orderFront()
+        // whenever the terminal is moved/resized/activated.
+        w.level = .normal
+        w.collectionBehavior = [.stationary, .ignoresCycle]
         w.ignoresMouseEvents = true
         w.hasShadow = false
 
@@ -94,6 +100,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         t.onWindowLost = { [weak self] in
             self?.window?.orderOut(nil)
         }
+        t.onTerminalActivated = { [weak self] in
+            // Pull pet back above newly-focused siblings when the terminal
+            // is brought forward, so visibility rides with the terminal.
+            self?.window?.orderFront(nil)
+        }
         t.start()
         self.tracker = t
     }
@@ -101,10 +112,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func reposition(terminalAxFrame: CGRect) {
         guard let window else { return }
         let terminalNS = Self.nsRect(fromAX: terminalAxFrame)
-        // Pet sits on top edge: bottom of pet aligns with window's top.
+        // Top-right of the terminal. Paws dip `petOverlap` below the top edge
+        // so it looks like the pet is hanging on by its paws.
         let petFrame = NSRect(
-            x: terminalNS.minX + petInset,
-            y: terminalNS.maxY,
+            x: terminalNS.maxX - petSize - petInset,
+            y: terminalNS.maxY - petOverlap,
             width: petSize,
             height: petSize
         )

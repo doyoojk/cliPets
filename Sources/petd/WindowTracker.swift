@@ -13,11 +13,16 @@ final class WindowTracker {
     var onFrameChange: ((CGRect) -> Void)?
     /// Fires when the tracked window is closed, miniaturized, or its app quits.
     var onWindowLost: (() -> Void)?
+    /// Fires when the tracked terminal app is activated (brought frontmost).
+    /// Used to re-order the pet above newly-foremost windows without pinning
+    /// it above everything.
+    var onTerminalActivated: (() -> Void)?
 
     private var observer: AXObserver?
     private var trackedWindow: AXUIElement?
     private var trackedPid: pid_t?
     private var quitObserver: NSObjectProtocol?
+    private var activationObserver: NSObjectProtocol?
 
     func start() {
         guard ensureAccessibilityPermission() else {
@@ -34,6 +39,7 @@ final class WindowTracker {
         trackedWindow = window
         installObserver(pid: pid, window: window)
         watchForAppTermination(pid: pid)
+        watchForAppActivation(pid: pid)
 
         if let frame = Self.frame(of: window) {
             onFrameChange?(frame)
@@ -51,10 +57,14 @@ final class WindowTracker {
         if let quitObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(quitObserver)
         }
+        if let activationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
+        }
         observer = nil
         trackedWindow = nil
         trackedPid = nil
         quitObserver = nil
+        activationObserver = nil
     }
 
     // MARK: - Lookup
@@ -130,6 +140,23 @@ final class WindowTracker {
             else { return }
             MainActor.assumeIsolated {
                 self?.onWindowLost?()
+            }
+        }
+    }
+
+    private func watchForAppActivation(pid: pid_t) {
+        let center = NSWorkspace.shared.notificationCenter
+        activationObserver = center.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard
+                let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                app.processIdentifier == pid
+            else { return }
+            MainActor.assumeIsolated {
+                self?.onTerminalActivated?()
             }
         }
     }
