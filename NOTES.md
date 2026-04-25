@@ -67,6 +67,18 @@ activation handler re-orders it above. Imperceptible in practice.
   observe `kAXFocusedUIElementChangedNotification` and re-order earlier in
   the activation pipeline.
 
+## clipets symlink in /opt/homebrew/bin (Phase 3)
+
+Dev shortcut: `/opt/homebrew/bin/clipets` is a symlink to
+`~/Code/cliPets/.build/debug/clipets` so Claude Code hooks can use the
+short name. The symlink is fine across debug rebuilds (same path) but
+goes stale on a release build (`.build/release/clipets`).
+
+- **Target**: Phase 9. Signed `.app` bundle installs the CLI at a
+  stable path (e.g., `/Applications/cliPets.app/Contents/MacOS/clipets`)
+  and the install step manages the symlink. After that, this manual
+  symlink should be removed in favor of the packaged install.
+
 ## Multi-display sanity check (Phase 2)
 
 `AppDelegate.nsRect(fromAX:)` uses `NSScreen.screens.first` (the screen at
