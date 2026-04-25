@@ -19,8 +19,14 @@ final class WindowTracker {
     /// Fires with the terminal window's frame in AX coordinates (top-left
     /// origin, Y grows downward). Callers translate to NS coords.
     var onFrameChange: ((CGRect) -> Void)?
-    /// Fires when the window is closed, miniaturized, or its app quits.
+    /// Fires when the window is destroyed (closed) or its app terminates.
+    /// Indicates the pet should tear down permanently.
     var onWindowLost: (() -> Void)?
+    /// Fires when the window is miniaturized into the Dock. Pet should hide
+    /// but not destroy itself — onWindowShown will fire when it comes back.
+    var onWindowHidden: (() -> Void)?
+    /// Fires when the window is deminiaturized (returns from the Dock).
+    var onWindowShown: (() -> Void)?
     /// Fires when the terminal app is brought to the front. Used to re-anchor
     /// pet Z-order above the terminal.
     var onTerminalActivated: (() -> Void)?
@@ -134,11 +140,18 @@ final class WindowTracker {
 
     fileprivate func handle(notification: String) {
         switch notification {
-        case kAXMovedNotification, kAXResizedNotification, kAXWindowDeminiaturizedNotification:
+        case kAXMovedNotification, kAXResizedNotification:
             if let frame = Self.frame(of: element) {
                 onFrameChange?(frame)
             }
-        case kAXUIElementDestroyedNotification, kAXWindowMiniaturizedNotification:
+        case kAXWindowMiniaturizedNotification:
+            onWindowHidden?()
+        case kAXWindowDeminiaturizedNotification:
+            onWindowShown?()
+            if let frame = Self.frame(of: element) {
+                onFrameChange?(frame)
+            }
+        case kAXUIElementDestroyedNotification:
             onWindowLost?()
         default:
             break

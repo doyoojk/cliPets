@@ -69,11 +69,11 @@ activation handler re-orders it above. Imperceptible in practice.
 
 ## Session-to-window binding heuristic (Phase 6 lite)
 
-When a hook event fires, we spawn the pet on the currently focused terminal
-window via `TerminalLocator.focusedTerminalWindow()`. If the user is focused
-on Chrome (or any non-terminal app) when the event arrives, we fall back to
-the first terminal we find — which may not be the one that actually
-generated the event, so the pet can land on the wrong terminal.
+When the first hook for a session fires, we bind the pet to the currently
+focused terminal window. If the user is focused on Chrome (or any
+non-terminal app) at that moment, we fall back to the first terminal we
+find — which may not be the one that actually generated the event, so the
+pet can land on the wrong terminal.
 
 - **Target**: Phase 6 proper. The robust fix is title-based session
   matching: `clipets install-hooks` injects a shell prelude that sets the
@@ -81,9 +81,36 @@ generated the event, so the pet can land on the wrong terminal.
   hook events by `session_id` against the AX `kAXTitleAttribute` of every
   open terminal window. Then the pet always lands on the right window.
 - **Mitigation in the meantime**: keep the terminal focused during the
-  first hook of a new session. Once a window is bound to an overlay, it
-  sticks for the life of the window — subsequent events just animate the
-  existing pet.
+  first hook of a new session. The `SessionStart` hook (wired in
+  `~/.claude/settings.json`) fires the moment `claude` launches, so the
+  binding usually catches the right window automatically.
+
+## Pre-existing sessions don't auto-spawn pets
+
+Pets are now keyed by `session_id` and spawn on the first hook event for
+each session. Sessions running before `petd` was launched won't get a pet
+until *something* in that session fires a hook (UserPromptSubmit, Stop,
+PreToolUse, etc.). New sessions opened via `claude` after `petd` is
+running spawn immediately because of the SessionStart hook.
+
+- **Mitigation**: typing any prompt in an existing session triggers
+  UserPromptSubmit (when wired) or another hook, which spawns the pet.
+- **Target**: Phase 7+. Walk the process tree at `petd` startup to find
+  running `claude` processes, derive their session_ids from
+  `~/.claude/sessions/`, and synthesize spawn events.
+
+## Active-tab vs all-tabs visibility (Phase 6 lite)
+
+Multiple sessions in tabs of the same Ghostty window currently show all
+their pets simultaneously, stacked horizontally along the top edge. AX
+sees Ghostty windows but not tabs, so we can't directly tell which tab is
+visible. Each pet auto-shrinks (down to a 22pt floor) so up to ~7 pets
+fit on a single window.
+
+- **Target**: Phase 6 proper. With title-based session marking (above),
+  we'd parse the window's AX title for `claude:<sessionId>` and hide all
+  other session-pets for that window. Terminal.app is unaffected — each
+  tab is its own AXWindow, so each pet already maps cleanly.
 
 ## clipets symlink in /opt/homebrew/bin (Phase 3)
 

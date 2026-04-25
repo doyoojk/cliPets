@@ -8,20 +8,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var eventServer: EventServer?
     private var spriteFrames: [CGImage] = []
 
-    /// One pet per terminal window we've seen Claude activity on, keyed by
-    /// CGWindowID.
-    private var overlays: [CGWindowID: PetOverlay] = [:]
+    /// One pet per Claude session, keyed by session_id.
+    private var overlays: [String: PetOverlay] = [:]
+    /// Ordered slot list of session_ids per terminal window. The slot index
+    /// determines stacking position along the window's top-right edge, and
+    /// the count determines auto-fit pet size.
+    private var sessionsByWindow: [CGWindowID: [String]] = [:]
+
+    private let maxPetSize: CGFloat = 70
+    private let minPetSize: CGFloat = 22
+    private let petGap: CGFloat = 6
+    /// Reserved on the left of the window for the traffic-light buttons and
+    /// any window-title controls; we don't try to stack pets across that area.
+    private let leftReserved: CGFloat = 90
+    private let rightInset: CGFloat = 12
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let granted = ensureAccessibilityPermission(prompt: true)
+        _ = ensureAccessibilityPermission(prompt: true)
         buildSpriteFrames()
         startFrameSync()
         startEventServer()
-        if granted {
-            discoverExistingTerminalWindows()
-        } else {
-            NSLog("cliPets: Accessibility permission missing; pets will only spawn when hook events fire from a focused terminal")
-        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -29,6 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             overlay.close()
         }
         overlays.removeAll()
+        sessionsByWindow.removeAll()
         if let displayLink {
             CVDisplayLinkStop(displayLink)
         }
@@ -59,54 +66,102 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         eventServer = server
     }
 
-    /// Phase 4 will branch on event.eventType to drive different animations.
-    /// For now we just ensure a pet exists on whichever terminal window
-    /// the user was focused on when the event fired, and log.
+    /// One pet per Claude session. The session is bound to whichever terminal
+    /// window is focused at the moment the first hook for that session
+    /// arrives — wire up the SessionStart hook (in ~/.claude/settings.json)
+    /// so this happens the instant a session opens, while the user is still
+    /// looking at the right terminal.
     private func handleHookEvent(_ event: HookEvent) {
         NSLog(
             "cliPets: hook \(event.eventType) tool=\(event.toolName ?? "-") session=\(event.sessionId?.prefix(8) ?? "-") cwd=\(event.cwd ?? "-")"
         )
-        guard let match = TerminalLocator.focusedTerminalWindow() else {
-            NSLog("cliPets: no terminal window focused at hook time; skipping pet spawn")
+        guard let sessionId = event.sessionId else { return }
+
+        if let existing = overlays[sessionId] {
+            existing.recordEvent(event)
             return
         }
-        ensureOverlay(pid: match.pid, element: match.element, windowID: match.windowID)
-        overlays[match.windowID]?.recordEvent(event)
+
+        guard let match = TerminalLocator.focusedTerminalWindow() else {
+            NSLog("cliPets: no terminal window focused; can't bind new session \(sessionId.prefix(8))")
+            return
+        }
+
+        spawnOverlay(
+            sessionId: sessionId,
+            pid: match.pid,
+            element: match.element,
+            windowID: match.windowID,
+            event: event
+        )
     }
 
-    /// At launch, spawn a pet on every visible Ghostty / Terminal.app window
-    /// the user already has open. Without this, petd waits for a hook event
-    /// to fire before any pets appear — confusing if you already have several
-    /// Claude sessions running idle.
-    private func discoverExistingTerminalWindows() {
-        let apps = NSWorkspace.shared.runningApplications.filter {
-            guard let id = $0.bundleIdentifier else { return false }
-            return SupportedTerminal.bundleIds.contains(id)
+    private func spawnOverlay(
+        sessionId: String,
+        pid: pid_t,
+        element: AXUIElement,
+        windowID: CGWindowID,
+        event: HookEvent
+    ) {
+        var sessions = sessionsByWindow[windowID, default: []]
+        sessions.append(sessionId)
+        sessionsByWindow[windowID] = sessions
+
+        let petSize = computePetSize(forWindowID: windowID, count: sessions.count)
+        let overlay = PetOverlay(
+            sessionId: sessionId,
+            pid: pid,
+            element: element,
+            windowID: windowID,
+            slotIndex: sessions.count - 1,
+            petSize: petSize,
+            frames: spriteFrames
+        )
+        overlay.recordEvent(event)
+        overlay.onClosed = { [weak self, sessionId, windowID] in
+            self?.overlayDidClose(sessionId: sessionId, windowID: windowID)
         }
-        for app in apps {
-            let pid = app.processIdentifier
-            let appEl = AXUIElementCreateApplication(pid)
-            guard
-                let windowsRef = WindowTracker.copyAttribute(appEl, kAXWindowsAttribute),
-                let windows = windowsRef as? [AXUIElement]
-            else { continue }
-            for element in windows {
-                var wid: CGWindowID = 0
-                guard _AXUIElementGetWindow(element, &wid) == .success, wid != 0 else { continue }
-                ensureOverlay(pid: pid, element: element, windowID: wid)
-            }
-        }
-        NSLog("cliPets: discovered \(overlays.count) terminal window(s) at startup")
+        overlays[sessionId] = overlay
+
+        // After mutation, resize all siblings on this window so the new
+        // count fits.
+        relayoutPets(forWindowID: windowID)
+
+        NSLog(
+            "cliPets: spawned pet for session \(sessionId.prefix(8)) on window \(windowID); now \(sessions.count) pet(s) on this window, size \(Int(petSize))pt"
+        )
     }
 
-    private func ensureOverlay(pid: pid_t, element: AXUIElement, windowID: CGWindowID) {
-        if overlays[windowID] != nil { return }
-        let overlay = PetOverlay(pid: pid, element: element, windowID: windowID, frames: spriteFrames)
-        overlay.onClosed = { [weak self, windowID] in
-            self?.overlays.removeValue(forKey: windowID)
+    private func overlayDidClose(sessionId: String, windowID: CGWindowID) {
+        overlays.removeValue(forKey: sessionId)
+        guard var sessions = sessionsByWindow[windowID] else { return }
+        sessions.removeAll { $0 == sessionId }
+        if sessions.isEmpty {
+            sessionsByWindow.removeValue(forKey: windowID)
+            return
         }
-        overlays[windowID] = overlay
-        NSLog("cliPets: spawned pet for window \(windowID) (pid \(pid)). Active pets: \(overlays.count)")
+        sessionsByWindow[windowID] = sessions
+        relayoutPets(forWindowID: windowID)
+    }
+
+    /// Recompute petSize and reassign slot indices for every pet on a window.
+    private func relayoutPets(forWindowID windowID: CGWindowID) {
+        guard let sessions = sessionsByWindow[windowID] else { return }
+        let petSize = computePetSize(forWindowID: windowID, count: sessions.count)
+        for (index, sessionId) in sessions.enumerated() {
+            guard let overlay = overlays[sessionId] else { continue }
+            overlay.slotIndex = index
+            overlay.petSize = petSize
+        }
+    }
+
+    /// Per-window pet sizing: shrink uniformly so all pets fit between the
+    /// traffic-light area and the right edge.
+    private func computePetSize(forWindowID windowID: CGWindowID, count: Int) -> CGFloat {
+        let windowWidth = Self.frameFromCGWindowList(windowID: windowID)?.width ?? 800
+        let available = max(0, windowWidth - leftReserved - rightInset)
+        let perPet = available / CGFloat(count) - petGap
+        return min(maxPetSize, max(minPetSize, perPet))
     }
 
     // MARK: - Display link drives all overlays
@@ -125,6 +180,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     fileprivate func displayLinkTick() {
+        // First, recompute pet size if any tracked window changed width.
+        // Only triggers a relayout if the recomputed size differs by ≥1pt
+        // from the current size, so this is cheap on idle frames.
+        for (windowID, sessions) in sessionsByWindow where sessions.count > 1 {
+            guard
+                let firstSession = sessions.first,
+                let firstOverlay = overlays[firstSession]
+            else { continue }
+            let target = computePetSize(forWindowID: windowID, count: sessions.count)
+            if abs(target - firstOverlay.petSize) >= 1 {
+                relayoutPets(forWindowID: windowID)
+            }
+        }
+
+        // Then sync each pet's position from the cheap CGWindowList.
         for overlay in overlays.values {
             overlay.syncFromCGWindowList()
         }
@@ -132,10 +202,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Static helpers (used by PetOverlay)
 
-    /// Pet positions read from CGWindowList in the hot loop instead of AX
-    /// (no IPC to the terminal app, just a cached lookup). Returns the
-    /// terminal's bounds in screen coordinates with origin at upper-left
-    /// (same orientation as AX).
     static func frameFromCGWindowList(windowID: CGWindowID) -> CGRect? {
         let opts: CGWindowListOption = .optionIncludingWindow
         guard
@@ -150,9 +216,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return rect
     }
 
-    /// Converts an AX rect (top-left origin, Y downward, relative to primary
-    /// display) to an NS rect (bottom-left origin, Y upward, primary screen's
-    /// bottom-left at (0,0)).
     static func nsRect(fromAX axRect: CGRect) -> NSRect {
         guard let primary = NSScreen.screens.first else { return .zero }
         return NSRect(
@@ -168,9 +231,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return "\(home)/.clipets/clipets.sock"
     }
 
-    /// EventServer's @Sendable callback fires off the main actor and can't
-    /// directly capture a non-Sendable AppDelegate, so we publish a weak
-    /// global reference set during applicationDidFinishLaunching.
     fileprivate static weak var shared: AppDelegate?
 
     override init() {
@@ -179,9 +239,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-/// CVDisplayLink output callback. Runs on the CV thread; hops to main to
-/// touch AppKit. Captures AppDelegate via Unmanaged so we don't fight Swift's
-/// strict concurrency about C function pointers.
 private func cliPetsDisplayLinkCallback(
     displayLink: CVDisplayLink,
     inNow: UnsafePointer<CVTimeStamp>,
