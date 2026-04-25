@@ -67,6 +67,24 @@ activation handler re-orders it above. Imperceptible in practice.
   observe `kAXFocusedUIElementChangedNotification` and re-order earlier in
   the activation pipeline.
 
+## Session-to-window binding heuristic (Phase 6 lite)
+
+When a hook event fires, we spawn the pet on the currently focused terminal
+window via `TerminalLocator.focusedTerminalWindow()`. If the user is focused
+on Chrome (or any non-terminal app) when the event arrives, we fall back to
+the first terminal we find — which may not be the one that actually
+generated the event, so the pet can land on the wrong terminal.
+
+- **Target**: Phase 6 proper. The robust fix is title-based session
+  matching: `clipets install-hooks` injects a shell prelude that sets the
+  terminal title to `claude:<sessionId>` via OSC 0/2 escape, and we match
+  hook events by `session_id` against the AX `kAXTitleAttribute` of every
+  open terminal window. Then the pet always lands on the right window.
+- **Mitigation in the meantime**: keep the terminal focused during the
+  first hook of a new session. Once a window is bound to an overlay, it
+  sticks for the life of the window — subsequent events just animate the
+  existing pet.
+
 ## clipets symlink in /opt/homebrew/bin (Phase 3)
 
 Dev shortcut: `/opt/homebrew/bin/clipets` is a symlink to

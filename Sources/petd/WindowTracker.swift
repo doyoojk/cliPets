@@ -3,67 +3,43 @@ import AppKit
 
 // Private but stable-for-years AX SPI used by Rectangle, yabai, etc. Returns
 // the CGWindowID for an AXUIElement so we can Z-order cross-app windows
-// with NSWindow.orderWindow(.above, relativeTo:).
+// with NSWindow.order(.above, relativeTo:).
 @_silgen_name("_AXUIElementGetWindow")
-private func _AXUIElementGetWindow(_ element: AXUIElement, _ windowId: UnsafeMutablePointer<CGWindowID>) -> AXError
+func _AXUIElementGetWindow(_ element: AXUIElement, _ windowId: UnsafeMutablePointer<CGWindowID>) -> AXError
 
-/// Finds the frontmost supported terminal window, pins an overlay to it,
-/// and keeps the overlay in sync with move/resize/close events via AXObserver.
-///
-/// Phase 2: single window. Phase 6 will generalize to multiple windows keyed
-/// by (bundleId, windowId, sessionId).
+/// Watches a single terminal window via AXObserver. One instance per pet.
+/// Multiple WindowTrackers can co-exist for the same pid (AX allows multiple
+/// observers per process).
 @MainActor
 final class WindowTracker {
-    /// Fires with the terminal window's current frame in AX coordinates
-    /// (top-left origin, Y grows downward). Callers translate to NS coords.
+    let pid: pid_t
+    let element: AXUIElement
+    let windowID: CGWindowID
+
+    /// Fires with the terminal window's frame in AX coordinates (top-left
+    /// origin, Y grows downward). Callers translate to NS coords.
     var onFrameChange: ((CGRect) -> Void)?
-    /// Fires when the tracked window is closed, miniaturized, or its app quits.
+    /// Fires when the window is closed, miniaturized, or its app quits.
     var onWindowLost: (() -> Void)?
-    /// Fires when the tracked terminal app is activated (brought frontmost).
-    /// Used to re-order the pet above newly-foremost windows without pinning
-    /// it above everything.
+    /// Fires when the terminal app is brought to the front. Used to re-anchor
+    /// pet Z-order above the terminal.
     var onTerminalActivated: (() -> Void)?
 
     private var observer: AXObserver?
-    private var trackedWindow: AXUIElement?
-    private var trackedPid: pid_t?
     private var quitObserver: NSObjectProtocol?
     private var activationObserver: NSObjectProtocol?
 
-    /// CGWindowID of the tracked terminal window, for cross-app Z-ordering.
-    var trackedWindowID: CGWindowID? {
-        guard let trackedWindow else { return nil }
-        var id: CGWindowID = 0
-        let err = _AXUIElementGetWindow(trackedWindow, &id)
-        return err == .success ? id : nil
-    }
-
-    /// Current AX frame of the tracked terminal window, queried on demand.
-    /// Used by the frame-sync poll to keep the pet locked to the window
-    /// during live drags (AX move notifications alone are throttled).
-    var currentTerminalFrame: CGRect? {
-        guard let trackedWindow else { return nil }
-        return Self.frame(of: trackedWindow)
+    init(pid: pid_t, element: AXUIElement, windowID: CGWindowID) {
+        self.pid = pid
+        self.element = element
+        self.windowID = windowID
     }
 
     func start() {
-        guard ensureAccessibilityPermission() else {
-            NSLog("cliPets: Accessibility permission not granted. Open System Settings > Privacy & Security > Accessibility and enable the petd binary. Re-run petd after granting.")
-            return
-        }
-
-        guard let (pid, window) = findFrontmostTerminalWindow() else {
-            NSLog("cliPets: no Ghostty or Terminal.app window found. Start a terminal and relaunch petd.")
-            return
-        }
-
-        trackedPid = pid
-        trackedWindow = window
-        installObserver(pid: pid, window: window)
-        watchForAppTermination(pid: pid)
-        watchForAppActivation(pid: pid)
-
-        if let frame = Self.frame(of: window) {
+        installObserver()
+        watchForAppTermination()
+        watchForAppActivation()
+        if let frame = Self.frame(of: element) {
             onFrameChange?(frame)
         }
     }
@@ -83,62 +59,33 @@ final class WindowTracker {
             NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
         }
         observer = nil
-        trackedWindow = nil
-        trackedPid = nil
         quitObserver = nil
         activationObserver = nil
     }
 
-    // MARK: - Lookup
-
-    private func findFrontmostTerminalWindow() -> (pid_t, AXUIElement)? {
-        let candidates = NSWorkspace.shared.runningApplications
-            .filter {
-                guard let id = $0.bundleIdentifier else { return false }
-                return SupportedTerminal.bundleIds.contains(id)
-            }
-            .sorted { (a, _) in a.isActive } // active-first, stable otherwise
-
-        for app in candidates {
-            let pid = app.processIdentifier
-            let appEl = AXUIElementCreateApplication(pid)
-            if let focusedRef = Self.copyAttribute(appEl, kAXFocusedWindowAttribute),
-               CFGetTypeID(focusedRef) == AXUIElementGetTypeID() {
-                let window = focusedRef as! AXUIElement
-                return (pid, window)
-            }
-            if let windowsRef = Self.copyAttribute(appEl, kAXWindowsAttribute),
-               let windows = windowsRef as? [AXUIElement],
-               let first = windows.first {
-                return (pid, first)
-            }
-        }
-        return nil
-    }
-
     // MARK: - Observer
 
-    private func installObserver(pid: pid_t, window: AXUIElement) {
+    private func installObserver() {
         var obs: AXObserver?
         let err = AXObserverCreate(pid, windowTrackerAXCallback, &obs)
         guard err == .success, let obs else {
-            NSLog("cliPets: AXObserverCreate failed with error \(err.rawValue)")
+            NSLog("cliPets: AXObserverCreate failed (\(err.rawValue))")
             return
         }
         self.observer = obs
 
         let refcon = Unmanaged.passUnretained(self).toOpaque()
-        let notifications: [String] = [
+        let names: [String] = [
             kAXMovedNotification,
             kAXResizedNotification,
             kAXUIElementDestroyedNotification,
             kAXWindowMiniaturizedNotification,
             kAXWindowDeminiaturizedNotification,
         ]
-        for name in notifications {
-            let addErr = AXObserverAddNotification(obs, window, name as CFString, refcon)
-            if addErr != .success && addErr != .notificationAlreadyRegistered {
-                NSLog("cliPets: AXObserverAddNotification(\(name)) failed: \(addErr.rawValue)")
+        for name in names {
+            let r = AXObserverAddNotification(obs, element, name as CFString, refcon)
+            if r != .success && r != .notificationAlreadyRegistered {
+                NSLog("cliPets: AXObserverAddNotification(\(name)) failed: \(r.rawValue)")
             }
         }
 
@@ -149,7 +96,7 @@ final class WindowTracker {
         )
     }
 
-    private func watchForAppTermination(pid: pid_t) {
+    private func watchForAppTermination() {
         let center = NSWorkspace.shared.notificationCenter
         quitObserver = center.addObserver(
             forName: NSWorkspace.didTerminateApplicationNotification,
@@ -158,15 +105,16 @@ final class WindowTracker {
         ) { [weak self] note in
             guard
                 let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                app.processIdentifier == pid
+                let me = self,
+                app.processIdentifier == me.pid
             else { return }
             MainActor.assumeIsolated {
-                self?.onWindowLost?()
+                me.onWindowLost?()
             }
         }
     }
 
-    private func watchForAppActivation(pid: pid_t) {
+    private func watchForAppActivation() {
         let center = NSWorkspace.shared.notificationCenter
         activationObserver = center.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
@@ -175,19 +123,19 @@ final class WindowTracker {
         ) { [weak self] note in
             guard
                 let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                app.processIdentifier == pid
+                let me = self,
+                app.processIdentifier == me.pid
             else { return }
             MainActor.assumeIsolated {
-                self?.onTerminalActivated?()
+                me.onTerminalActivated?()
             }
         }
     }
 
     fileprivate func handle(notification: String) {
-        guard let trackedWindow else { return }
         switch notification {
         case kAXMovedNotification, kAXResizedNotification, kAXWindowDeminiaturizedNotification:
-            if let frame = Self.frame(of: trackedWindow) {
+            if let frame = Self.frame(of: element) {
                 onFrameChange?(frame)
             }
         case kAXUIElementDestroyedNotification, kAXWindowMiniaturizedNotification:
@@ -198,12 +146,6 @@ final class WindowTracker {
     }
 
     // MARK: - AX helpers
-
-    private static func copyAttribute(_ element: AXUIElement, _ attribute: String) -> CFTypeRef? {
-        var value: CFTypeRef?
-        let err = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
-        return err == .success ? value : nil
-    }
 
     static func frame(of window: AXUIElement) -> CGRect? {
         guard
@@ -217,19 +159,24 @@ final class WindowTracker {
         guard okPos, okSize else { return nil }
         return CGRect(origin: origin, size: size)
     }
+
+    static func copyAttribute(_ element: AXUIElement, _ attribute: String) -> CFTypeRef? {
+        var value: CFTypeRef?
+        let err = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
+        return err == .success ? value : nil
+    }
 }
 
 // MARK: - Permission
 
-private func ensureAccessibilityPermission() -> Bool {
+func ensureAccessibilityPermission(prompt: Bool) -> Bool {
     let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-    let options = [promptKey: true] as CFDictionary
+    let options = [promptKey: prompt] as CFDictionary
     return AXIsProcessTrustedWithOptions(options)
 }
 
 // MARK: - C callback
 
-/// C-callable AX observer callback. Dispatches into the tracker via refcon.
 private func windowTrackerAXCallback(
     observer: AXObserver,
     element: AXUIElement,
