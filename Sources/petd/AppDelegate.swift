@@ -13,10 +13,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var overlays: [CGWindowID: PetOverlay] = [:]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        _ = ensureAccessibilityPermission(prompt: true)
+        let granted = ensureAccessibilityPermission(prompt: true)
         buildSpriteFrames()
         startFrameSync()
         startEventServer()
+        if granted {
+            discoverExistingTerminalWindows()
+        } else {
+            NSLog("cliPets: Accessibility permission missing; pets will only spawn when hook events fire from a focused terminal")
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -66,6 +71,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         ensureOverlay(pid: match.pid, element: match.element, windowID: match.windowID)
+        overlays[match.windowID]?.recordEvent(event)
+    }
+
+    /// At launch, spawn a pet on every visible Ghostty / Terminal.app window
+    /// the user already has open. Without this, petd waits for a hook event
+    /// to fire before any pets appear — confusing if you already have several
+    /// Claude sessions running idle.
+    private func discoverExistingTerminalWindows() {
+        let apps = NSWorkspace.shared.runningApplications.filter {
+            guard let id = $0.bundleIdentifier else { return false }
+            return SupportedTerminal.bundleIds.contains(id)
+        }
+        for app in apps {
+            let pid = app.processIdentifier
+            let appEl = AXUIElementCreateApplication(pid)
+            guard
+                let windowsRef = WindowTracker.copyAttribute(appEl, kAXWindowsAttribute),
+                let windows = windowsRef as? [AXUIElement]
+            else { continue }
+            for element in windows {
+                var wid: CGWindowID = 0
+                guard _AXUIElementGetWindow(element, &wid) == .success, wid != 0 else { continue }
+                ensureOverlay(pid: pid, element: element, windowID: wid)
+            }
+        }
+        NSLog("cliPets: discovered \(overlays.count) terminal window(s) at startup")
     }
 
     private func ensureOverlay(pid: pid_t, element: AXUIElement, windowID: CGWindowID) {
