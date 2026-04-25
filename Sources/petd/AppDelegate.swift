@@ -77,13 +77,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         guard let sessionId = event.sessionId else { return }
 
+        // Session ended → remove the pet for that session.
+        if event.eventType == "SessionEnd" {
+            if let overlay = overlays[sessionId] {
+                NSLog("cliPets: closing pet for session \(sessionId.prefix(8)) (SessionEnd)")
+                overlay.close()
+            }
+            return
+        }
+
         if let existing = overlays[sessionId] {
             existing.recordEvent(event)
             return
         }
 
-        guard let match = TerminalLocator.focusedTerminalWindow() else {
-            NSLog("cliPets: no terminal window focused; can't bind new session \(sessionId.prefix(8))")
+        // For a new session, prefer matching the hook's cwd against terminal
+        // window titles (most shells embed the cwd basename in the title).
+        // This gives us the right window even when the user has switched
+        // focus elsewhere. Fall back to the focused terminal otherwise.
+        var match: TerminalLocator.Match?
+        if let cwd = event.cwd, let m = TerminalLocator.windowMatchingCwd(cwd) {
+            NSLog("cliPets: bound new session \(sessionId.prefix(8)) by cwd match (\(cwd))")
+            match = m
+        }
+        if match == nil, let m = TerminalLocator.focusedTerminalWindow() {
+            NSLog("cliPets: bound new session \(sessionId.prefix(8)) to focused terminal")
+            match = m
+        }
+        guard let match else {
+            NSLog("cliPets: no terminal window matched for session \(sessionId.prefix(8))")
             return
         }
 

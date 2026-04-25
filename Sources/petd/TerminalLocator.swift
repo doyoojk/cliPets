@@ -13,6 +13,37 @@ enum TerminalLocator {
         let windowID: CGWindowID
     }
 
+    /// Finds a terminal window whose AX title hints at the given cwd. We
+    /// match the cwd's last path component against the title's lowercase
+    /// substring — most shells include the current directory's basename in
+    /// the window title, so this is a strong signal even when the user has
+    /// switched focus away from the terminal that fired the hook.
+    static func windowMatchingCwd(_ cwd: String) -> Match? {
+        let needle = (cwd as NSString).lastPathComponent.lowercased()
+        guard !needle.isEmpty else { return nil }
+
+        let apps = NSWorkspace.shared.runningApplications.filter {
+            guard let id = $0.bundleIdentifier else { return false }
+            return SupportedTerminal.bundleIds.contains(id)
+        }
+        for app in apps {
+            let pid = app.processIdentifier
+            let appEl = AXUIElementCreateApplication(pid)
+            guard
+                let ref = WindowTracker.copyAttribute(appEl, kAXWindowsAttribute),
+                let windows = ref as? [AXUIElement]
+            else { continue }
+            for element in windows {
+                let title = (WindowTracker.copyAttribute(element, kAXTitleAttribute) as? String)?.lowercased() ?? ""
+                guard title.contains(needle) else { continue }
+                var wid: CGWindowID = 0
+                guard _AXUIElementGetWindow(element, &wid) == .success, wid != 0 else { continue }
+                return Match(pid: pid, element: element, windowID: wid)
+            }
+        }
+        return nil
+    }
+
     static func focusedTerminalWindow() -> Match? {
         let candidates = NSWorkspace.shared.runningApplications
             .filter {
