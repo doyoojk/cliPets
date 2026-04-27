@@ -56,10 +56,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Adopt pre-existing sessions
 
-    /// At launch, scan ~/.claude/projects/ for session files modified in the
-    /// last 4 hours and synthesize a bind event for each unknown session so
-    /// the user's running Claude sessions get pets without having to type a
-    /// prompt first.
+    /// At launch, walk every open terminal window and bind it to the most
+    /// recent Claude session whose decoded project-cwd matches the window's
+    /// AX title. No time filter — a pet appears for any open terminal that
+    /// has ever had a Claude session, whether or not Claude is still running.
     private func adoptRecentSessions() {
         let fm = FileManager.default
         let home = fm.homeDirectoryForCurrentUser.path
@@ -71,38 +71,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             options: .skipsHiddenFiles
         ) else { return }
 
-        let cutoff = Date().addingTimeInterval(-4 * 3600)
+        // Build map: lowercase-basename → [(cwd, projectDir)] for all project dirs.
+        var byBasename: [String: [(cwd: String, dir: URL)]] = [:]
+        for dir in projectDirs {
+            guard
+                (try? dir.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true,
+                let cwd = Self.decodeCwd(fromProjectDirName: dir.lastPathComponent)
+            else { continue }
+            let basename = (cwd as NSString).lastPathComponent.lowercased()
+            guard !basename.isEmpty else { continue }
+            byBasename[basename, default: []].append((cwd: cwd, dir: dir))
+        }
 
-        for projectDir in projectDirs {
-            guard (try? projectDir.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { continue }
+        // For each open terminal window, find the most recent session that matches.
+        for terminal in TerminalLocator.allTerminalWindows() {
+            let title = (WindowTracker.copyAttribute(terminal.element, kAXTitleAttribute) as? String ?? "").lowercased()
+            guard !title.isEmpty else { continue }
 
-            let cwd = Self.decodeCwd(fromProjectDirName: projectDir.lastPathComponent)
-            guard let jsonlFiles = try? fm.contentsOfDirectory(
-                at: projectDir,
-                includingPropertiesForKeys: [.contentModificationDateKey],
-                options: .skipsHiddenFiles
-            ) else { continue }
+            // Try every project whose cwd basename appears in the title.
+            var bestFile: URL? = nil
+            var bestCwd: String? = nil
+            var bestMtime = Date.distantPast
 
-            for file in jsonlFiles where file.pathExtension == "jsonl" {
-                guard
-                    let attrs = try? file.resourceValues(forKeys: [.contentModificationDateKey]),
-                    let mtime = attrs.contentModificationDate,
-                    mtime > cutoff
-                else { continue }
+            for (basename, entries) in byBasename {
+                guard title.contains(basename) else { continue }
+                for entry in entries {
+                    guard let files = try? fm.contentsOfDirectory(
+                        at: entry.dir,
+                        includingPropertiesForKeys: [.contentModificationDateKey],
+                        options: .skipsHiddenFiles
+                    ) else { continue }
+                    for file in files where file.pathExtension == "jsonl" {
+                        guard
+                            let attrs = try? file.resourceValues(forKeys: [.contentModificationDateKey]),
+                            let mtime = attrs.contentModificationDate,
+                            mtime > bestMtime
+                        else { continue }
+                        bestMtime = mtime
+                        bestFile = file
+                        bestCwd = entry.cwd
+                    }
+                }
+            }
 
-                let sessionId = file.deletingPathExtension().lastPathComponent
-                guard overlays[sessionId] == nil else { continue }
+            guard let file = bestFile, let cwd = bestCwd else { continue }
+            let sessionId = file.deletingPathExtension().lastPathComponent
+            guard overlays[sessionId] == nil else { continue }
 
-                let event = HookEvent(
+            NSLog("cliPets: adoptRecentSessions — window \(terminal.windowID) title='\(title)' → session \(sessionId.prefix(8)) cwd=\(cwd)")
+            spawnOverlay(
+                sessionId: sessionId,
+                pid: terminal.pid,
+                element: terminal.element,
+                windowID: terminal.windowID,
+                event: HookEvent(
                     eventType: "SessionStart",
                     cwd: cwd,
                     sessionId: sessionId,
                     transcriptPath: file.path,
                     toolName: nil
                 )
-                NSLog("cliPets: adoptRecentSessions — synthesising event for session \(sessionId.prefix(8)) cwd=\(cwd ?? "-")")
-                handleHookEvent(event)
-            }
+            )
         }
     }
 

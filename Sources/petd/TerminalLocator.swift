@@ -44,6 +44,29 @@ enum TerminalLocator {
         return nil
     }
 
+    /// Returns every open window across all supported terminal apps.
+    static func allTerminalWindows() -> [Match] {
+        var results: [Match] = []
+        let apps = NSWorkspace.shared.runningApplications.filter {
+            guard let id = $0.bundleIdentifier else { return false }
+            return SupportedTerminal.bundleIds.contains(id)
+        }
+        for app in apps {
+            let pid = app.processIdentifier
+            let appEl = AXUIElementCreateApplication(pid)
+            guard
+                let ref = WindowTracker.copyAttribute(appEl, kAXWindowsAttribute),
+                let windows = ref as? [AXUIElement]
+            else { continue }
+            for element in windows {
+                var wid: CGWindowID = 0
+                guard _AXUIElementGetWindow(element, &wid) == .success, wid != 0 else { continue }
+                results.append(Match(pid: pid, element: element, windowID: wid))
+            }
+        }
+        return results
+    }
+
     static func focusedTerminalWindow() -> Match? {
         let candidates = NSWorkspace.shared.runningApplications
             .filter {
