@@ -200,13 +200,16 @@ final class PetOverlay {
 
     private func identifyingText() -> String {
         let appName = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "terminal"
-        let title = (WindowTracker.copyAttribute(element, kAXTitleAttribute) as? String) ?? ""
 
         var parts: [String] = [appName]
-        if !title.isEmpty {
-            parts.append(title)
-        } else if let cwd = lastCwd {
+        // Prefer the session's own cwd over the live AX window title — the
+        // window title reflects whichever tab is currently active, which is
+        // wrong when multiple sessions share a window (e.g. Ghostty tabs).
+        if let cwd = lastCwd, !cwd.isEmpty {
             parts.append((cwd as NSString).lastPathComponent)
+        } else {
+            let title = (WindowTracker.copyAttribute(element, kAXTitleAttribute) as? String) ?? ""
+            if !title.isEmpty { parts.append(title) }
         }
         if sessionId.count >= 8 {
             parts.append("session \(sessionId.prefix(8))")
