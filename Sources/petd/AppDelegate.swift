@@ -82,10 +82,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard !basename.isEmpty else { continue }
             byBasename[basename, default: []].append((cwd: cwd, dir: dir))
         }
+        NSLog("cliPets: adoptRecentSessions — found \(byBasename.keys.sorted().joined(separator: ", ")) project basenames")
+
+        let allWindows = TerminalLocator.allTerminalWindows()
+        NSLog("cliPets: adoptRecentSessions — found \(allWindows.count) terminal window(s)")
 
         // For each open terminal window, find the most recent session that matches.
-        for terminal in TerminalLocator.allTerminalWindows() {
+        for terminal in allWindows {
             let title = (WindowTracker.copyAttribute(terminal.element, kAXTitleAttribute) as? String ?? "").lowercased()
+            NSLog("cliPets: adoptRecentSessions — window \(terminal.windowID) title='\(title)'")
             guard !title.isEmpty else { continue }
 
             // Try every project whose cwd basename appears in the title.
@@ -95,6 +100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             for (basename, entries) in byBasename {
                 guard title.contains(basename) else { continue }
+                NSLog("cliPets: adoptRecentSessions —   basename '\(basename)' matched title")
                 for entry in entries {
                     guard let files = try? fm.contentsOfDirectory(
                         at: entry.dir,
@@ -114,9 +120,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            guard let file = bestFile, let cwd = bestCwd else { continue }
+            guard let file = bestFile, let cwd = bestCwd else {
+                NSLog("cliPets: adoptRecentSessions —   no session matched for window \(terminal.windowID)")
+                continue
+            }
             let sessionId = file.deletingPathExtension().lastPathComponent
-            guard overlays[sessionId] == nil else { continue }
+            guard overlays[sessionId] == nil else {
+                NSLog("cliPets: adoptRecentSessions —   session \(sessionId.prefix(8)) already has an overlay, skipping")
+                continue
+            }
 
             NSLog("cliPets: adoptRecentSessions — window \(terminal.windowID) title='\(title)' → session \(sessionId.prefix(8)) cwd=\(cwd)")
             spawnOverlay(
