@@ -247,7 +247,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         relayoutPets(forWindowID: windowID)
 
         NSLog(
-            "cliPets: spawned pet for session \(sessionId.prefix(8)) on window \(windowID); now \(sessions.count) pet(s) on this window, size \(Int(petSize))pt"
+            "cliPets: spawned pet for session \(sessionId.prefix(8)) on window \(windowID) slot \(sessions.count - 1); \(sessions.count) pet(s) on this window"
         )
     }
 
@@ -263,7 +263,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         relayoutPets(forWindowID: windowID)
     }
 
-    /// Recompute petSize and reassign slot indices for every pet on a window.
+    /// Recompute petSize and reassign slot indices for every pet on a window,
+    /// then force-sync each pet to the correct position immediately rather than
+    /// waiting for the next display-link tick.
     private func relayoutPets(forWindowID windowID: CGWindowID) {
         guard let sessions = sessionsByWindow[windowID] else { return }
         let petSize = computePetSize(forWindowID: windowID, count: sessions.count)
@@ -271,6 +273,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let overlay = overlays[sessionId] else { continue }
             overlay.slotIndex = index
             overlay.petSize = petSize
+            overlay.forceSync()
+            NSLog("cliPets: relayout session \(sessionId.prefix(8)) → slot \(index), size \(Int(petSize))pt, window \(windowID)")
         }
     }
 

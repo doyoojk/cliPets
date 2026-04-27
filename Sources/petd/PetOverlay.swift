@@ -131,6 +131,13 @@ final class PetOverlay {
         applyFrame(fromTopLeftRect: frame)
     }
 
+    /// Force an immediate reposition without waiting for the display-link tick.
+    /// Call after slot/size changes to snap to the correct position right away.
+    func forceSync() {
+        lastTerminalFrame = nil
+        syncFromCGWindowList()
+    }
+
     func hide() {
         guard !isClosed, !isHidden else { return }
         isHidden = true
