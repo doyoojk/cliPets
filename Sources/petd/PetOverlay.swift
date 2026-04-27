@@ -1,75 +1,51 @@
 import AppKit
-@preconcurrency import ApplicationServices
 import QuartzCore
 
-/// One pet representing one Claude session. Multiple PetOverlays can share a
-/// terminal window — they're stacked horizontally along the window's top
-/// edge and resize to fit the available width.
+/// One pet representing one Claude session. All pets float in a horizontal
+/// row just below the menu bar, always visible regardless of which terminal
+/// window or tab is in front.
 @MainActor
 final class PetOverlay {
     let sessionId: String
-    let pid: pid_t
-    let windowID: CGWindowID
 
-    /// Fired when the overlay tears itself down (window destroyed, app
-    /// quit). AppDelegate uses this to remove the overlay and relayout
-    /// siblings on the same window.
+    /// Fired when the overlay tears itself down. AppDelegate uses this to
+    /// remove the overlay and relayout siblings.
     var onClosed: (() -> Void)?
 
-    /// Stack position on the window's top edge. 0 = rightmost. AppDelegate
-    /// reassigns this when sibling pets are added or removed.
+    /// Position in the screen-top row. 0 = rightmost. AppDelegate reassigns
+    /// this when sessions are added or removed.
     var slotIndex: Int = 0 {
-        didSet { invalidateLayout() }
+        didSet { applyScreenPosition() }
     }
 
-    /// Square size of the pet, in points. AppDelegate computes this per-window
-    /// based on the number of pets sharing the window and the window width.
-    var petSize: CGFloat = 70 {
+    /// Square size of the pet, in points.
+    var petSize: CGFloat = 44 {
         didSet { onPetSizeChanged() }
     }
 
-    /// Distance from the window's right edge to the rightmost pet.
     private let petInset: CGFloat = 12
-    /// Gap between adjacent pets.
     private let petGap: CGFloat = 6
-    /// How far the paws dip below the terminal's top edge.
-    private let petOverlap: CGFloat = 20
 
-    private let element: AXUIElement
     private let frames: [CGImage]
     private let window: NSWindow
     private let contentView: PetContentView
-    private let tracker: WindowTracker
     private var animationTimer: Timer?
     private var tickCount: Int = 0
-    private var lastTerminalFrame: CGRect?
     private var isClosed = false
     private var isHidden = false
 
-    // Most recent hook event info, surfaced when user clicks the pet.
-    private var lastEventType: String?
     private var lastCwd: String?
+    private var lastEventType: String?
 
     private var infoWindow: NSWindow?
     private var infoLabel: NSTextField?
     private var infoFadeTimer: Timer?
 
-    init(
-        sessionId: String,
-        pid: pid_t,
-        element: AXUIElement,
-        windowID: CGWindowID,
-        slotIndex: Int,
-        petSize: CGFloat,
-        frames: [CGImage]
-    ) {
+    init(sessionId: String, slotIndex: Int, petSize: CGFloat, frames: [CGImage]) {
         self.sessionId = sessionId
-        self.pid = pid
-        self.windowID = windowID
-        self.element = element
-        self.frames = frames
         self.slotIndex = slotIndex
         self.petSize = petSize
+        self.frames = frames
 
         let w = NSWindow(
             contentRect: NSRect(x: -10_000, y: -10_000, width: petSize, height: petSize),
@@ -79,8 +55,8 @@ final class PetOverlay {
         )
         w.isOpaque = false
         w.backgroundColor = .clear
-        w.level = .normal
-        w.collectionBehavior = [.transient, .ignoresCycle]
+        w.level = .floating
+        w.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         w.ignoresMouseEvents = false
         w.hasShadow = false
 
@@ -94,41 +70,17 @@ final class PetOverlay {
         w.contentView = cv
         self.window = w
         self.contentView = cv
-        self.tracker = WindowTracker(pid: pid, element: element, windowID: windowID)
 
         cv.onClick = { [weak self] in self?.showInfo() }
 
-        tracker.onFrameChange = { [weak self] axFrame in
-            self?.applyFrame(fromTopLeftRect: axFrame)
-            self?.anchorAboveTerminalIfVisible()
-        }
-        tracker.onWindowLost = { [weak self] in
-            self?.close()
-        }
-        tracker.onWindowHidden = { [weak self] in
-            self?.hide()
-        }
-        tracker.onWindowShown = { [weak self] in
-            self?.show()
-        }
-        tracker.onTerminalActivated = { [weak self] in
-            self?.anchorAboveTerminalIfVisible()
-        }
-        tracker.start()
-
+        applyScreenPosition()
+        window.orderFront(nil)
         startAnimationTimer()
     }
 
     func recordEvent(_ event: HookEvent) {
         lastEventType = event.eventType
         lastCwd = event.cwd
-    }
-
-    /// Called by AppDelegate's display link tick.
-    func syncFromCGWindowList() {
-        guard !isClosed, !isHidden else { return }
-        guard let frame = AppDelegate.frameFromCGWindowList(windowID: windowID) else { return }
-        applyFrame(fromTopLeftRect: frame)
     }
 
     func hide() {
@@ -142,12 +94,8 @@ final class PetOverlay {
     func show() {
         guard !isClosed else { return }
         isHidden = false
-        // Force a reposition next sync.
-        lastTerminalFrame = nil
-        if let frame = AppDelegate.frameFromCGWindowList(windowID: windowID) {
-            applyFrame(fromTopLeftRect: frame)
-        }
-        anchorAboveTerminalIfVisible()
+        applyScreenPosition()
+        window.orderFront(nil)
     }
 
     func close() {
@@ -159,9 +107,34 @@ final class PetOverlay {
         infoFadeTimer = nil
         infoWindow?.orderOut(nil)
         infoWindow = nil
-        tracker.stop()
         window.orderOut(nil)
         onClosed?()
+    }
+
+    /// Called by AppDelegate when the screen configuration may have changed.
+    func syncPosition() {
+        guard !isClosed, !isHidden else { return }
+        applyScreenPosition()
+    }
+
+    // MARK: - Screen positioning
+
+    func applyScreenPosition() {
+        guard let screen = NSScreen.main else { return }
+        let menuBarHeight = NSStatusBar.system.thickness
+        // Sit flush against the bottom of the menu bar.
+        let y = screen.frame.maxY - menuBarHeight - petSize
+        let x = screen.frame.maxX - petSize - petInset - CGFloat(slotIndex) * (petSize + petGap)
+        window.setFrame(
+            NSRect(origin: NSPoint(x: x, y: y), size: CGSize(width: petSize, height: petSize)),
+            display: false
+        )
+    }
+
+    private func onPetSizeChanged() {
+        contentView.frame = NSRect(origin: .zero, size: CGSize(width: petSize, height: petSize))
+        contentView.layer?.frame = contentView.bounds
+        applyScreenPosition()
     }
 
     // MARK: - Identification bubble
@@ -188,7 +161,6 @@ final class PetOverlay {
         if !info.isVisible {
             info.orderFront(nil)
         }
-        info.order(.above, relativeTo: Int(windowID))
 
         infoFadeTimer?.invalidate()
         infoFadeTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
@@ -199,22 +171,14 @@ final class PetOverlay {
     }
 
     private func identifyingText() -> String {
-        let appName = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "terminal"
-
-        var parts: [String] = [appName]
-        // Prefer the session's own cwd over the live AX window title — the
-        // window title reflects whichever tab is currently active, which is
-        // wrong when multiple sessions share a window (e.g. Ghostty tabs).
+        var parts: [String] = []
         if let cwd = lastCwd, !cwd.isEmpty {
             parts.append((cwd as NSString).lastPathComponent)
-        } else {
-            let title = (WindowTracker.copyAttribute(element, kAXTitleAttribute) as? String) ?? ""
-            if !title.isEmpty { parts.append(title) }
         }
         if sessionId.count >= 8 {
             parts.append("session \(sessionId.prefix(8))")
         }
-        return parts.joined(separator: " — ")
+        return parts.isEmpty ? sessionId : parts.joined(separator: " — ")
     }
 
     private func ensureInfoWindow() -> NSWindow {
@@ -257,38 +221,6 @@ final class PetOverlay {
         return label
     }
 
-    // MARK: - Frame + Z-ordering
-
-    private func applyFrame(fromTopLeftRect rect: CGRect) {
-        if rect == lastTerminalFrame { return }
-        lastTerminalFrame = rect
-        let terminalNS = AppDelegate.nsRect(fromAX: rect)
-        let xOffset = CGFloat(slotIndex) * (petSize + petGap)
-        let origin = NSPoint(
-            x: terminalNS.maxX - petSize - petInset - xOffset,
-            y: terminalNS.maxY - petOverlap
-        )
-        window.setFrame(NSRect(origin: origin, size: CGSize(width: petSize, height: petSize)), display: false)
-    }
-
-    private func anchorAboveTerminalIfVisible() {
-        guard !isClosed, !isHidden else { return }
-        if !window.isVisible {
-            window.orderFront(nil)
-        }
-        window.order(.above, relativeTo: Int(windowID))
-    }
-
-    private func invalidateLayout() {
-        lastTerminalFrame = nil
-    }
-
-    private func onPetSizeChanged() {
-        contentView.frame = NSRect(origin: .zero, size: CGSize(width: petSize, height: petSize))
-        contentView.layer?.frame = contentView.bounds
-        invalidateLayout()
-    }
-
     // MARK: - Animation
 
     private func startAnimationTimer() {
@@ -311,8 +243,8 @@ final class PetOverlay {
 }
 
 /// Custom content view that does pixel-perfect hit testing against the
-/// current sprite frame, so transparent corners of the pet's bounding
-/// window pass clicks through to whatever is underneath (the terminal).
+/// current sprite frame, so transparent corners pass clicks through to
+/// whatever is underneath.
 @MainActor
 final class PetContentView: NSView {
     var onClick: (() -> Void)?

@@ -10,18 +10,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// One pet per Claude session, keyed by session_id.
     private var overlays: [String: PetOverlay] = [:]
-    /// Ordered slot list of session_ids per terminal window. The slot index
-    /// determines stacking position along the window's top-right edge, and
-    /// the count determines auto-fit pet size.
-    private var sessionsByWindow: [CGWindowID: [String]] = [:]
+    /// Ordered list of session_ids — index determines slot (0 = rightmost).
+    private var sessionOrder: [String] = []
 
     private let maxPetSize: CGFloat = 70
     private let minPetSize: CGFloat = 22
     private let petGap: CGFloat = 6
-    /// Reserved on the left of the window for the traffic-light buttons and
-    /// any window-title controls; we don't try to stack pets across that area.
-    private let leftReserved: CGFloat = 90
     private let rightInset: CGFloat = 12
+    /// Reserved on the left so pets don't run off screen.
+    private let leftMargin: CGFloat = 90
+
+    private var lastScreenFrame: CGRect?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let granted = ensureAccessibilityPermission(prompt: true)
@@ -38,7 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             overlay.close()
         }
         overlays.removeAll()
-        sessionsByWindow.removeAll()
+        sessionOrder.removeAll()
         if let displayLink {
             CVDisplayLinkStop(displayLink)
         }
@@ -56,86 +55,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Adopt pre-existing sessions
 
-    /// At launch, walk every open terminal window and bind it to the most
-    /// recent Claude session whose decoded project-cwd matches the window's
-    /// AX title. No time filter — a pet appears for any open terminal that
-    /// has ever had a Claude session, whether or not Claude is still running.
+    /// At launch, find running `claude` processes via lsof, derive their
+    /// project directories, and spawn a pet for the most recent session in
+    /// each. No time filter — if a `claude` process is running, it gets a pet.
     private func adoptRecentSessions() {
+        let cwds = runningClaudeCwds()
+        NSLog("cliPets: adoptRecentSessions — found \(cwds.count) running claude cwd(s): \(cwds.joined(separator: ", "))")
+
         let fm = FileManager.default
         let home = fm.homeDirectoryForCurrentUser.path
         let projectsRoot = URL(fileURLWithPath: "\(home)/.claude/projects")
 
-        guard let projectDirs = try? fm.contentsOfDirectory(
-            at: projectsRoot,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: .skipsHiddenFiles
-        ) else { return }
+        for cwd in cwds {
+            let encoded = Self.encodeProjectDirName(cwd: cwd)
+            let projectDir = projectsRoot.appendingPathComponent(encoded)
 
-        // Build map: lowercase-basename → [(cwd, projectDir)] for all project dirs.
-        var byBasename: [String: [(cwd: String, dir: URL)]] = [:]
-        for dir in projectDirs {
-            guard
-                (try? dir.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true,
-                let cwd = Self.decodeCwd(fromProjectDirName: dir.lastPathComponent)
-            else { continue }
-            let basename = (cwd as NSString).lastPathComponent.lowercased()
-            guard !basename.isEmpty else { continue }
-            byBasename[basename, default: []].append((cwd: cwd, dir: dir))
-        }
-        NSLog("cliPets: adoptRecentSessions — found \(byBasename.keys.sorted().joined(separator: ", ")) project basenames")
+            NSLog("cliPets: adoptRecentSessions — checking \(projectDir.path)")
 
-        let allWindows = TerminalLocator.allTerminalWindows()
-        NSLog("cliPets: adoptRecentSessions — found \(allWindows.count) terminal window(s)")
-
-        // For each open terminal window, find the most recent session that matches.
-        for terminal in allWindows {
-            let title = (WindowTracker.copyAttribute(terminal.element, kAXTitleAttribute) as? String ?? "").lowercased()
-            NSLog("cliPets: adoptRecentSessions — window \(terminal.windowID) title='\(title)'")
-            guard !title.isEmpty else { continue }
-
-            // Try every project whose cwd basename appears in the title.
-            var bestFile: URL? = nil
-            var bestCwd: String? = nil
-            var bestMtime = Date.distantPast
-
-            for (basename, entries) in byBasename {
-                guard title.contains(basename) else { continue }
-                NSLog("cliPets: adoptRecentSessions —   basename '\(basename)' matched title")
-                for entry in entries {
-                    guard let files = try? fm.contentsOfDirectory(
-                        at: entry.dir,
-                        includingPropertiesForKeys: [.contentModificationDateKey],
-                        options: .skipsHiddenFiles
-                    ) else { continue }
-                    for file in files where file.pathExtension == "jsonl" {
-                        guard
-                            let attrs = try? file.resourceValues(forKeys: [.contentModificationDateKey]),
-                            let mtime = attrs.contentModificationDate,
-                            mtime > bestMtime
-                        else { continue }
-                        bestMtime = mtime
-                        bestFile = file
-                        bestCwd = entry.cwd
-                    }
-                }
-            }
-
-            guard let file = bestFile, let cwd = bestCwd else {
-                NSLog("cliPets: adoptRecentSessions —   no session matched for window \(terminal.windowID)")
+            guard let files = try? fm.contentsOfDirectory(
+                at: projectDir,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: .skipsHiddenFiles
+            ) else {
+                NSLog("cliPets: adoptRecentSessions — no project dir at \(projectDir.path)")
                 continue
             }
+
+            let sorted = files
+                .filter { $0.pathExtension == "jsonl" }
+                .sorted {
+                    let a = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                    let b = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                    return a > b
+                }
+
+            guard let file = sorted.first else {
+                NSLog("cliPets: adoptRecentSessions — no session files in \(projectDir.path)")
+                continue
+            }
+
             let sessionId = file.deletingPathExtension().lastPathComponent
             guard overlays[sessionId] == nil else {
-                NSLog("cliPets: adoptRecentSessions —   session \(sessionId.prefix(8)) already has an overlay, skipping")
+                NSLog("cliPets: adoptRecentSessions — session \(sessionId.prefix(8)) already has an overlay")
                 continue
             }
 
-            NSLog("cliPets: adoptRecentSessions — window \(terminal.windowID) title='\(title)' → session \(sessionId.prefix(8)) cwd=\(cwd)")
+            NSLog("cliPets: adoptRecentSessions — spawning pet for session \(sessionId.prefix(8)) cwd=\(cwd)")
             spawnOverlay(
                 sessionId: sessionId,
-                pid: terminal.pid,
-                element: terminal.element,
-                windowID: terminal.windowID,
                 event: HookEvent(
                     eventType: "SessionStart",
                     cwd: cwd,
@@ -147,19 +114,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Decode a Claude project directory name back into a filesystem path.
-    /// Encoding: leading `-` = initial `/`; `--` = literal `-`; `-` = `/`.
-    /// Dots are also encoded as `-`, so the result is an approximation, but
-    /// the last path component is preserved for TerminalLocator cwd matching.
-    private static func decodeCwd(fromProjectDirName name: String) -> String? {
-        guard name.hasPrefix("-") else { return nil }
-        let body = String(name.dropFirst())  // strip leading `-` (= `/`)
-        // Replace `--` (escaped hyphen) with a placeholder before splitting.
-        let placeholder = "\u{0}"
-        let escaped = body.replacingOccurrences(of: "--", with: placeholder)
-        let decoded = escaped.replacingOccurrences(of: "-", with: "/")
-            .replacingOccurrences(of: placeholder, with: "-")
-        return "/" + decoded
+    /// Run `lsof` to find the working directories of all processes named `claude`.
+    private func runningClaudeCwds() -> [String] {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/bash")
+        // pgrep -x matches the exact process name; xargs feeds each PID to lsof.
+        task.arguments = [
+            "-c",
+            "pgrep -x claude | xargs -I{} lsof -p {} -a -d cwd -Fn 2>/dev/null | grep '^n' | sort -u | sed 's/^n//'"
+        ]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = Pipe()
+        guard (try? task.run()) != nil else { return [] }
+        task.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        return output.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+    }
+
+    /// Encode a filesystem path to the format Claude uses for project directory names:
+    /// replace `/` with `-` then `.` with `-`.
+    private static func encodeProjectDirName(cwd: String) -> String {
+        cwd.replacingOccurrences(of: "/", with: "-")
+           .replacingOccurrences(of: ".", with: "-")
     }
 
     // MARK: - Event server
@@ -177,18 +155,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         eventServer = server
     }
 
-    /// One pet per Claude session. The session is bound to whichever terminal
-    /// window is focused at the moment the first hook for that session
-    /// arrives — wire up the SessionStart hook (in ~/.claude/settings.json)
-    /// so this happens the instant a session opens, while the user is still
-    /// looking at the right terminal.
     private func handleHookEvent(_ event: HookEvent) {
         NSLog(
             "cliPets: hook \(event.eventType) tool=\(event.toolName ?? "-") session=\(event.sessionId?.prefix(8) ?? "-") cwd=\(event.cwd ?? "-")"
         )
         guard let sessionId = event.sessionId else { return }
 
-        // Session ended → remove the pet for that session.
         if event.eventType == "SessionEnd" {
             if let overlay = overlays[sessionId] {
                 NSLog("cliPets: closing pet for session \(sessionId.prefix(8)) (SessionEnd)")
@@ -202,108 +174,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // For a new session, prefer matching the hook's cwd against terminal
-        // window titles (most shells embed the cwd basename in the title).
-        // This gives us the right window even when the user has switched
-        // focus elsewhere. Fall back to the focused terminal otherwise.
-        var match: TerminalLocator.Match?
-        if let cwd = event.cwd, let m = TerminalLocator.windowMatchingCwd(cwd) {
-            NSLog("cliPets: bound new session \(sessionId.prefix(8)) by cwd match (\(cwd))")
-            match = m
-        }
-        if match == nil, let m = TerminalLocator.focusedTerminalWindow() {
-            NSLog("cliPets: bound new session \(sessionId.prefix(8)) to focused terminal")
-            match = m
-        }
-        guard let match else {
-            NSLog("cliPets: no terminal window matched for session \(sessionId.prefix(8))")
-            return
-        }
-
-        spawnOverlay(
-            sessionId: sessionId,
-            pid: match.pid,
-            element: match.element,
-            windowID: match.windowID,
-            event: event
-        )
+        // New session — spawn a pet and place it at the screen top.
+        NSLog("cliPets: new session \(sessionId.prefix(8)) — spawning pet")
+        spawnOverlay(sessionId: sessionId, event: event)
     }
 
-    private func spawnOverlay(
-        sessionId: String,
-        pid: pid_t,
-        element: AXUIElement,
-        windowID: CGWindowID,
-        event: HookEvent
-    ) {
-        var sessions = sessionsByWindow[windowID, default: []]
-        sessions.append(sessionId)
-        sessionsByWindow[windowID] = sessions
-
-        let petSize = computePetSize(forWindowID: windowID, count: sessions.count)
+    private func spawnOverlay(sessionId: String, event: HookEvent) {
+        sessionOrder.append(sessionId)
+        let petSize = computePetSize(count: sessionOrder.count)
         let overlay = PetOverlay(
             sessionId: sessionId,
-            pid: pid,
-            element: element,
-            windowID: windowID,
-            slotIndex: sessions.count - 1,
+            slotIndex: sessionOrder.count - 1,
             petSize: petSize,
             frames: spriteFrames
         )
         overlay.recordEvent(event)
-        overlay.onClosed = { [weak self, sessionId, windowID] in
-            self?.overlayDidClose(sessionId: sessionId, windowID: windowID)
+        overlay.onClosed = { [weak self, sessionId] in
+            self?.overlayDidClose(sessionId: sessionId)
         }
         overlays[sessionId] = overlay
-
-        // After mutation, resize all siblings on this window so the new
-        // count fits.
-        relayoutPets(forWindowID: windowID)
+        relayoutAllPets()
 
         NSLog(
-            "cliPets: spawned pet for session \(sessionId.prefix(8)) on window \(windowID); now \(sessions.count) pet(s) on this window, size \(Int(petSize))pt"
+            "cliPets: spawned pet for session \(sessionId.prefix(8)); \(sessionOrder.count) pet(s) total, size \(Int(petSize))pt"
         )
     }
 
-    private func overlayDidClose(sessionId: String, windowID: CGWindowID) {
+    private func overlayDidClose(sessionId: String) {
         overlays.removeValue(forKey: sessionId)
-        guard var sessions = sessionsByWindow[windowID] else { return }
-        sessions.removeAll { $0 == sessionId }
-        if sessions.isEmpty {
-            sessionsByWindow.removeValue(forKey: windowID)
-            return
-        }
-        sessionsByWindow[windowID] = sessions
-        relayoutPets(forWindowID: windowID)
+        sessionOrder.removeAll { $0 == sessionId }
+        relayoutAllPets()
     }
 
-    /// Recompute petSize and reassign slot indices for every pet on a window.
-    private func relayoutPets(forWindowID windowID: CGWindowID) {
-        guard let sessions = sessionsByWindow[windowID] else { return }
-        let petSize = computePetSize(forWindowID: windowID, count: sessions.count)
-        for (index, sessionId) in sessions.enumerated() {
+    /// Recompute petSize and slot indices for every pet.
+    private func relayoutAllPets() {
+        let petSize = computePetSize(count: sessionOrder.count)
+        for (index, sessionId) in sessionOrder.enumerated() {
             guard let overlay = overlays[sessionId] else { continue }
             overlay.slotIndex = index
             overlay.petSize = petSize
         }
     }
 
-    /// Per-window pet sizing: shrink uniformly so all pets fit between the
-    /// traffic-light area and the right edge.
-    private func computePetSize(forWindowID windowID: CGWindowID, count: Int) -> CGFloat {
-        let windowWidth = Self.frameFromCGWindowList(windowID: windowID)?.width ?? 800
-        let available = max(0, windowWidth - leftReserved - rightInset)
+    /// Shrink pets uniformly so all fit between the left margin and right edge.
+    private func computePetSize(count: Int) -> CGFloat {
+        guard count > 0 else { return maxPetSize }
+        let screenWidth = NSScreen.main?.frame.width ?? 1440
+        let available = max(0, screenWidth - leftMargin - rightInset)
         let perPet = available / CGFloat(count) - petGap
         return min(maxPetSize, max(minPetSize, perPet))
     }
 
-    // MARK: - Display link drives all overlays
+    // MARK: - Display link — reposition pets when screen changes
 
     private func startFrameSync() {
         var link: CVDisplayLink?
         let err = CVDisplayLinkCreateWithActiveCGDisplays(&link)
         guard err == kCVReturnSuccess, let link else {
-            NSLog("cliPets: CVDisplayLink unavailable (\(err)); pet positions will be tracker-driven only")
+            NSLog("cliPets: CVDisplayLink unavailable (\(err))")
             return
         }
         let refcon = Unmanaged.passUnretained(self).toOpaque()
@@ -313,51 +241,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     fileprivate func displayLinkTick() {
-        // First, recompute pet size if any tracked window changed width.
-        // Only triggers a relayout if the recomputed size differs by ≥1pt
-        // from the current size, so this is cheap on idle frames.
-        for (windowID, sessions) in sessionsByWindow where sessions.count > 1 {
-            guard
-                let firstSession = sessions.first,
-                let firstOverlay = overlays[firstSession]
-            else { continue }
-            let target = computePetSize(forWindowID: windowID, count: sessions.count)
-            if abs(target - firstOverlay.petSize) >= 1 {
-                relayoutPets(forWindowID: windowID)
-            }
-        }
-
-        // Then sync each pet's position from the cheap CGWindowList.
-        for overlay in overlays.values {
-            overlay.syncFromCGWindowList()
-        }
+        let frame = NSScreen.main?.frame
+        guard frame != lastScreenFrame else { return }
+        lastScreenFrame = frame
+        relayoutAllPets()
     }
 
-    // MARK: - Static helpers (used by PetOverlay)
-
-    static func frameFromCGWindowList(windowID: CGWindowID) -> CGRect? {
-        let opts: CGWindowListOption = .optionIncludingWindow
-        guard
-            let info = CGWindowListCopyWindowInfo(opts, windowID) as? [[String: Any]],
-            let dict = info.first,
-            let boundsCF = dict[kCGWindowBounds as String] as CFTypeRef?
-        else { return nil }
-        var rect = CGRect.zero
-        guard CGRectMakeWithDictionaryRepresentation(boundsCF as! CFDictionary, &rect) else {
-            return nil
-        }
-        return rect
-    }
-
-    static func nsRect(fromAX axRect: CGRect) -> NSRect {
-        guard let primary = NSScreen.screens.first else { return .zero }
-        return NSRect(
-            x: axRect.origin.x,
-            y: primary.frame.height - axRect.origin.y - axRect.size.height,
-            width: axRect.size.width,
-            height: axRect.size.height
-        )
-    }
+    // MARK: - Shared helpers
 
     static func defaultSocketPath() -> String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
