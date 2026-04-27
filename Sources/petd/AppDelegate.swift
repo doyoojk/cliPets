@@ -24,10 +24,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let rightInset: CGFloat = 12
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        _ = ensureAccessibilityPermission(prompt: true)
+        let granted = ensureAccessibilityPermission(prompt: true)
         buildSpriteFrames()
         startFrameSync()
         startEventServer()
+        if granted {
+            adoptRecentSessions()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -49,6 +52,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             SpriteBuilder.makeCat(state: .idle),
             SpriteBuilder.makeCat(state: .blink),
         ]
+    }
+
+    // MARK: - Adopt pre-existing sessions
+
+    /// At launch, scan ~/.claude/projects/ for session files modified in the
+    /// last 4 hours and synthesize a bind event for each unknown session so
+    /// the user's running Claude sessions get pets without having to type a
+    /// prompt first.
+    private func adoptRecentSessions() {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser.path
+        let projectsRoot = URL(fileURLWithPath: "\(home)/.claude/projects")
+
+        guard let projectDirs = try? fm.contentsOfDirectory(
+            at: projectsRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: .skipsHiddenFiles
+        ) else { return }
+
+        let cutoff = Date().addingTimeInterval(-4 * 3600)
+
+        for projectDir in projectDirs {
+            guard (try? projectDir.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { continue }
+
+            let cwd = Self.decodeCwd(fromProjectDirName: projectDir.lastPathComponent)
+            guard let jsonlFiles = try? fm.contentsOfDirectory(
+                at: projectDir,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: .skipsHiddenFiles
+            ) else { continue }
+
+            for file in jsonlFiles where file.pathExtension == "jsonl" {
+                guard
+                    let attrs = try? file.resourceValues(forKeys: [.contentModificationDateKey]),
+                    let mtime = attrs.contentModificationDate,
+                    mtime > cutoff
+                else { continue }
+
+                let sessionId = file.deletingPathExtension().lastPathComponent
+                guard overlays[sessionId] == nil else { continue }
+
+                let event = HookEvent(
+                    eventType: "SessionStart",
+                    cwd: cwd,
+                    sessionId: sessionId,
+                    transcriptPath: file.path,
+                    toolName: nil
+                )
+                NSLog("cliPets: adoptRecentSessions — synthesising event for session \(sessionId.prefix(8)) cwd=\(cwd ?? "-")")
+                handleHookEvent(event)
+            }
+        }
+    }
+
+    /// Decode a Claude project directory name back into a filesystem path.
+    /// Encoding: leading `-` = initial `/`; `--` = literal `-`; `-` = `/`.
+    /// Dots are also encoded as `-`, so the result is an approximation, but
+    /// the last path component is preserved for TerminalLocator cwd matching.
+    private static func decodeCwd(fromProjectDirName name: String) -> String? {
+        guard name.hasPrefix("-") else { return nil }
+        let body = String(name.dropFirst())  // strip leading `-` (= `/`)
+        // Replace `--` (escaped hyphen) with a placeholder before splitting.
+        let placeholder = "\u{0}"
+        let escaped = body.replacingOccurrences(of: "--", with: placeholder)
+        let decoded = escaped.replacingOccurrences(of: "-", with: "/")
+            .replacingOccurrences(of: placeholder, with: "-")
+        return "/" + decoded
     }
 
     // MARK: - Event server

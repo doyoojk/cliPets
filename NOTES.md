@@ -87,17 +87,11 @@ pet can land on the wrong terminal.
 
 ## Pre-existing sessions don't auto-spawn pets
 
-Pets are now keyed by `session_id` and spawn on the first hook event for
-each session. Sessions running before `petd` was launched won't get a pet
-until *something* in that session fires a hook (UserPromptSubmit, Stop,
-PreToolUse, etc.). New sessions opened via `claude` after `petd` is
-running spawn immediately because of the SessionStart hook.
-
-- **Mitigation**: typing any prompt in an existing session triggers
-  UserPromptSubmit (when wired) or another hook, which spawns the pet.
-- **Target**: Phase 7+. Walk the process tree at `petd` startup to find
-  running `claude` processes, derive their session_ids from
-  `~/.claude/sessions/`, and synthesize spawn events.
+**Resolved (Phase 6+)**: `adoptRecentSessions` runs at `petd` startup and
+scans `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` for files modified
+within the last 4 hours. Each matching file's stem is the session_id; petd
+synthesises a `SessionStart` HookEvent and routes it through the normal
+window-binding path. No user action or shell prelude required.
 
 ## Active-tab vs all-tabs visibility (Phase 6 lite)
 
