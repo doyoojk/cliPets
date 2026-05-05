@@ -3,127 +3,196 @@
 Caveats and follow-ups parked during the early phases. Each item names the
 phase that introduced it and a target phase to address it.
 
-## CVDisplayLink deprecation (Phase 2)
+---
+
+## v2 roadmap
+
+### Sprite artwork needed
+
+v1 uses procedurally-drawn pixel art (CGContext). v2 should replace these with
+hand-drawn sprite sheets. All sprites are **32×32 pixels**, displayed at 2× or
+3× with nearest-neighbor scaling.
+
+Each species needs the following animation frames:
+
+| Animation | Frames | Description |
+|-----------|--------|-------------|
+| `idle` | 2 | Normal sitting pose + blink variant (eyes closed/half) |
+| `working` | 2 | Ears perked, alert eyes, paws alternating up/down (typing) |
+| `writing` | 2 | Focused squint, forward paws alternating (same energy as working) |
+| `celebrate` | 4 | Bob up — peak — come down — land (confetti is drawn in code, no need in sprite) |
+| `alert` | 3 | Normal → ears wide → settle back (surprise/startle loop) |
+
+**Total per species: 13 frames.**
+
+v1 ships only the **cat** as procedural art. v2 target species (8 total):
+
+- cat *(procedural placeholder exists)*
+- dog
+- capybara
+- duck
+- bunny
+- bear
+- penguin
+- pig
+
+Each species also needs a **palette mask** (grayscale PNG, same dimensions as
+the sprite sheet) used for recoloring variants without redrawing every frame.
+See `Resources/pets/` for the intended layout:
+
+```
+Resources/pets/<species>/
+├── base.png           # default palette sprite sheet (all frames in a row)
+├── palette_mask.png   # grayscale slots for recoloring
+├── sheet.json         # frame data: name, x, y, w, h for each frame
+└── variants.toml      # named palettes: "orange", "gray", "cosmic", …
+```
+
+### Speech bubbles (Phase 5, deferred)
+
+The bubble rendering code exists (`BubbleRenderer.swift`) but is disabled
+because system font rendering in a CGContext doesn't look pixel-art. Options
+for v2:
+
+- Draw the text as actual pixel-art sprites (one image per message string)
+- Use a bitmap pixel font (e.g. Monocraft, Galmuri, Press Start 2P) and
+  render at 1px/pt with anti-aliasing fully off
+- Ship a tiny hand-drawn font as a sprite sheet and blit characters manually
+
+Bubble trigger mappings (already implemented, just needs re-enabling):
+
+| Hook / State | Bubble text |
+|---|---|
+| `Stop` (celebrate) | "done! ✨" |
+| `Notification` (alert) | "hey!" |
+| `PreToolUse` Bash (working) | "running…" |
+| `PreToolUse` Write / Edit (writing) | "writing…" |
+
+### More species (Phase 7 extension)
+
+Add dog, capybara, duck, bunny, bear, penguin, pig to `PetCatalog` once
+sprite sheets exist. Each species needs its own `SpriteBuilder` drawing
+functions (or a sprite-sheet loader to replace the procedural renderer).
+
+### Collection UI in paw menu (Phase 8 extension)
+
+The paw menu panel has a "Collection coming in Phase 7" placeholder. Replace
+with a grid view: unlocked variants in color with their name, locked ones as
+dark silhouettes with a "?" label.
+
+### Settings panel (Phase 8 extension)
+
+Add to the paw menu panel:
+- Pinned pet dropdown (Random / any unlocked variant)
+- Toggle: speech bubbles on/off
+- Toggle: click-through on pet overlays
+- Slider: sprite scale (2×, 3×, 4×)
+- Slider: unseen-pet boost (0×–4×)
+
+### Codesign + notarization (Phase 9 extension)
+
+Requires Apple Developer account ($99/year). Once obtained:
+
+```bash
+codesign --force --deep --sign "Developer ID Application: ..." \
+  --entitlements Installer/cliPets.entitlements \
+  /Applications/cliPets.app
+
+xcrun notarytool submit cliPets.zip \
+  --apple-id ... --team-id ... --password ... --wait
+
+xcrun stapler staple /Applications/cliPets.app
+```
+
+After notarization, users can open the app without the Gatekeeper warning.
+
+### Homebrew cask
+
+```ruby
+cask "clipets" do
+  version "1.0.0"
+  url "https://github.com/doyoojk/cliPets/releases/download/v#{version}/cliPets.zip"
+  name "cliPets"
+  app "cliPets.app"
+  binary "#{appdir}/cliPets.app/Contents/MacOS/clipets"
+end
+```
+
+### Additional terminal support
+
+Currently supports Ghostty and Terminal.app. Planned:
+- iTerm2 (`com.googlecode.iterm2`)
+- Alacritty (`org.alacritty`)
+- WezTerm (`com.github.wez.wezterm`)
+
+Add each as a new case in `TerminalLocator` / `SupportedTerminal`.
+
+---
+
+## Known issues / tech debt
+
+### CVDisplayLink deprecation (Phase 2)
 
 `CVDisplayLink` is deprecated in macOS 14 in favor of
-`NSView.displayLink(target:selector:)`. The deprecated API still works on
-macOS 13–15 and we use it for frame-rate-locked overlay positioning.
+`NSView.displayLink(target:selector:)`. Still works on macOS 13–15.
 
-- **Target**: Phase 9. Either bump the minimum to macOS 14 and switch, or
-  add an `#available(macOS 14, *)` branch and keep `CVDisplayLink` as a
-  fallback for macOS 13.
+- **Fix**: bump minimum to macOS 14 and switch, or add an `#available` branch.
 
-## DispatchQueue.main.async hop in display link callback (Phase 2)
+### DispatchQueue hop in display link callback (Phase 2)
 
-The CVDisplayLink callback fires on the CV thread, then we
-`DispatchQueue.main.async` to call AppKit. This adds ~1–2 ms of latency per
-tick. Imperceptible in practice but the obvious place to look if drag lock
-ever feels loose again.
+The CVDisplayLink callback fires on the CV thread and hops to main via
+`DispatchQueue.main.async`. Adds ~1–2 ms latency per tick — imperceptible
+in practice.
 
-- **Target**: only if needed. The fix is to do the
-  `CGWindowListCopyWindowInfo` read on the CV thread (it's thread-safe),
-  compare against a thread-safe `lastTerminalFrame` (atomic via
-  `OSAllocatedUnfairLock`), and only dispatch to main when the frame
-  actually changed.
+- **Fix** (if needed): read `CGWindowListCopyWindowInfo` on the CV thread
+  (thread-safe), compare against an atomic `lastTerminalFrame`, only dispatch
+  to main when the frame actually changed.
 
-## TCC permission flicker on rebuilds (Phase 2)
+### Sprite scaling fuzziness (Phase 1)
 
-`swift run petd` produces a fresh binary at `.build/…` each rebuild. macOS
-TCC sometimes re-prompts for Accessibility permission because the binary's
-identity changed.
+32×32 procedural sprites at non-integer scale produce uneven pixel widths.
+Hand-drawn sprite sheets at integer scale (e.g. 16×16 @ 3× = 48 pt) fix this.
 
-- **Target**: Phase 9. A signed `.app` bundle has a stable code signature,
-  so TCC recognizes it across rebuilds. Eliminates the re-prompt entirely.
-- **Dev workaround**: `codesign --force --deep --sign - .build/debug/petd`
-  after each build gives a stable ad-hoc identity.
+### Multi-tab in Ghostty (Phase 2)
 
-## Sprite scaling fuzziness (Phase 1)
+AX sees Ghostty windows but not individual tabs. Multiple Claude sessions in
+tabs of the same Ghostty window share one overlay. Terminal.app is unaffected.
 
-The 32×32 procedural cat renders at 1.5× (48 pt) with nearest-neighbor.
-Non-integer scaling produces uneven pixel widths — visibly fuzzy if you
-look closely.
+- **Fix**: title-based session matching via OSC 0/2 escape codes so each tab's
+  pet maps to its own session.
 
-- **Target**: Phase 7. Real sprite sheets ship at integer scales
-  (16×16 source @ 3× = 48 pt, or 32×32 @ 2× = 64 pt). Crisp by default.
+### Session-to-window binding heuristic (Phase 6)
 
-## Multi-tab in Ghostty (Phase 2)
+Pet binds to the focused terminal when the first hook fires. If the user is
+focused on a non-terminal app at that moment, the pet may land on the wrong
+window.
 
-AX sees Ghostty windows but not individual tabs. If multiple Claude
-sessions run in tabs of the same Ghostty window, they share one overlay.
+- **Fix**: shell prelude sets terminal title to `claude:<sessionId>` and we
+  match by title. `clipets install-hooks` would inject the prelude into
+  `~/.zshrc` / `~/.bashrc`.
 
-- **Target**: Phase 6. Title-based session matching via OSC 0/2 escape
-  ( shell prelude sets the tab title to `claude:<sessionId>`) gets us
-  partial coverage. Full per-tab tracking likely needs Ghostty
-  cooperation. Terminal.app is unaffected — each tab is its own
-  `AXWindow`.
+### Multi-display support (Phase 2)
 
-## Z-order delay on terminal activation (Phase 2)
+`AppDelegate.nsRect(fromAX:)` uses `NSScreen.screens.first`. Should work on
+secondary displays (NS coords are unified) but hasn't been tested.
 
-When you click back into the terminal after using another app, there's a
-~16 ms window where the pet still sits behind the terminal before our
-activation handler re-orders it above. Imperceptible in practice.
+- **Fix**: manual test — drag terminal between displays and confirm pet follows.
 
-- **Target**: only if it ever surfaces as a perceptible glitch. Fix is to
-  observe `kAXFocusedUIElementChangedNotification` and re-order earlier in
-  the activation pipeline.
+---
 
-## Session-to-window binding heuristic (Phase 6 lite)
+## Animation state machine — hook-to-animation mapping (Phase 4)
 
-When the first hook for a session fires, we bind the pet to the currently
-focused terminal window. If the user is focused on Chrome (or any
-non-terminal app) at that moment, we fall back to the first terminal we
-find — which may not be the one that actually generated the event, so the
-pet can land on the wrong terminal.
+| Hook event | Animation | Feel |
+|---|---|---|
+| Idle (no recent event) | `idle` | Sitting, slow blink every 3 s |
+| `UserPromptSubmit` | `listening` | Eyes half-closed, calm waiting mode |
+| `PreToolUse` Bash | `working` | Ears perked up, alert eyes, alternating paw tap |
+| `PreToolUse` Write / Edit | `writing` | Focused squint, forward paws typing |
+| `Stop` | `celebrate` | Squat → jump → peak → land squish (2 cycles ≈ 2 s) |
+| `Notification` | `alert` | Wide-eyed startle hop (3 cycles ≈ 2 s) |
+| `SessionStart` | idle | — |
+| `SessionEnd` | pet removed | — |
 
-- **Target**: Phase 6 proper. The robust fix is title-based session
-  matching: `clipets install-hooks` injects a shell prelude that sets the
-  terminal title to `claude:<sessionId>` via OSC 0/2 escape, and we match
-  hook events by `session_id` against the AX `kAXTitleAttribute` of every
-  open terminal window. Then the pet always lands on the right window.
-- **Mitigation in the meantime**: keep the terminal focused during the
-  first hook of a new session. The `SessionStart` hook (wired in
-  `~/.claude/settings.json`) fires the moment `claude` launches, so the
-  binding usually catches the right window automatically.
-
-## Pre-existing sessions don't auto-spawn pets
-
-**Resolved (Phase 6+)**: `adoptRecentSessions` runs at `petd` startup and
-scans `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` for files modified
-within the last 4 hours. Each matching file's stem is the session_id; petd
-synthesises a `SessionStart` HookEvent and routes it through the normal
-window-binding path. No user action or shell prelude required.
-
-## Active-tab vs all-tabs visibility (Phase 6 lite)
-
-Multiple sessions in tabs of the same Ghostty window currently show all
-their pets simultaneously, stacked horizontally along the top edge. AX
-sees Ghostty windows but not tabs, so we can't directly tell which tab is
-visible. Each pet auto-shrinks (down to a 22pt floor) so up to ~7 pets
-fit on a single window.
-
-- **Target**: Phase 6 proper. With title-based session marking (above),
-  we'd parse the window's AX title for `claude:<sessionId>` and hide all
-  other session-pets for that window. Terminal.app is unaffected — each
-  tab is its own AXWindow, so each pet already maps cleanly.
-
-## clipets symlink in /opt/homebrew/bin (Phase 3)
-
-Dev shortcut: `/opt/homebrew/bin/clipets` is a symlink to
-`~/Code/cliPets/.build/debug/clipets` so Claude Code hooks can use the
-short name. The symlink is fine across debug rebuilds (same path) but
-goes stale on a release build (`.build/release/clipets`).
-
-- **Target**: Phase 9. Signed `.app` bundle installs the CLI at a
-  stable path (e.g., `/Applications/cliPets.app/Contents/MacOS/clipets`)
-  and the install step manages the symlink. After that, this manual
-  symlink should be removed in favor of the packaged install.
-
-## Multi-display sanity check (Phase 2)
-
-`AppDelegate.nsRect(fromAX:)` uses `NSScreen.screens.first` (the screen at
-origin (0,0), i.e., the primary). Should work on a secondary display
-because NS coords are unified with the primary at origin, but it's never
-been exercised. Worth a sanity check when dragging the terminal between
-displays.
-
-- **Target**: a quick manual test before Phase 9 packaging.
+Priority rules: `alert`/`celebrate` (3) always fire; `working`/`writing` (2)
+fire unless a one-shot is playing; `listening` (1) only overrides idle.
+Looping states time out to idle after 8 s. `alert` loops until any new event.

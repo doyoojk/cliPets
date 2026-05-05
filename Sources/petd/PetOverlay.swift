@@ -35,20 +35,31 @@ final class PetOverlay {
     /// How far the paws dip below the terminal's top edge.
     private let petOverlap: CGFloat = 20
 
-    private let element: AXUIElement
-    private let frames: [CGImage]
+    let element: AXUIElement
+    private let sprites: [PetAnimationState: [CGImage]]
     private let window: NSWindow
     private let contentView: PetContentView
     private let tracker: WindowTracker
     private var animationTimer: Timer?
-    private var tickCount: Int = 0
     private var lastTerminalFrame: CGRect?
     private var isClosed = false
     private var isHidden = false
 
+    // Animation state machine
+    private var currentState: PetAnimationState = .idle
+    private var stateAge: Int = 0       // ticks elapsed in the current state
+    private var cyclesLeft: Int = 0     // remaining cycles for one-shot states
+    private var stateTimeoutTimer: Timer?
+
+    // Speech bubble
+    private var bubbleWindow: NSWindow?
+    private var bubbleLayer: CALayer?
+    private var bubbleHideTimer: Timer?
+
     // Most recent hook event info, surfaced when user clicks the pet.
     private var lastEventType: String?
     private var lastCwd: String?
+    private var sessionName: String?
 
     private var infoWindow: NSWindow?
     private var infoLabel: NSTextField?
@@ -61,13 +72,13 @@ final class PetOverlay {
         windowID: CGWindowID,
         slotIndex: Int,
         petSize: CGFloat,
-        frames: [CGImage]
+        sprites: [PetAnimationState: [CGImage]]
     ) {
         self.sessionId = sessionId
         self.pid = pid
         self.windowID = windowID
         self.element = element
-        self.frames = frames
+        self.sprites = sprites
         self.slotIndex = slotIndex
         self.petSize = petSize
 
@@ -79,7 +90,7 @@ final class PetOverlay {
         )
         w.isOpaque = false
         w.backgroundColor = .clear
-        w.level = .normal
+        w.level = .floating
         w.collectionBehavior = [.transient, .ignoresCycle]
         w.ignoresMouseEvents = false
         w.hasShadow = false
@@ -89,7 +100,7 @@ final class PetOverlay {
         cv.layer?.magnificationFilter = .nearest
         cv.layer?.minificationFilter = .nearest
         cv.layer?.contentsGravity = .resize
-        cv.layer?.contents = frames.first
+        cv.layer?.contents = sprites[.idle]?.first
 
         w.contentView = cv
         self.window = w
@@ -122,20 +133,120 @@ final class PetOverlay {
     func recordEvent(_ event: HookEvent) {
         lastEventType = event.eventType
         lastCwd = event.cwd
+        if sessionName == nil {
+            sessionName = Self.readSessionName(sessionId: sessionId)
+        }
+        switch event.eventType {
+        case "Stop":
+            triggerAnimation(.celebrate)
+        case "Notification":
+            triggerAnimation(.alert)
+        case "UserPromptSubmit":
+            triggerAnimation(.listening)
+        case "PreToolUse":
+            switch event.toolName {
+            case "Bash":            triggerAnimation(.working)
+            case "Write", "Edit":   triggerAnimation(.writing)
+            default:                break
+            }
+        default:
+            break
+        }
     }
 
-    /// Called by AppDelegate's display link tick.
+    private func triggerAnimation(_ state: PetAnimationState) {
+        // Alert loops until any new event replaces it; otherwise respect priority.
+        let canInterrupt = currentState == .alert || state.priority >= currentState.priority
+        guard canInterrupt else { return }
+        stateTimeoutTimer?.invalidate()
+        stateTimeoutTimer = nil
+        currentState = state
+        stateAge = 0
+        switch state {
+        case .celebrate:
+            cyclesLeft = 2
+        case .alert:
+            cyclesLeft = 0
+        case .listening, .working, .writing:
+            cyclesLeft = 0
+            stateTimeoutTimer = Timer.scheduledTimer(
+                withTimeInterval: 8.0, repeats: false
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.transitionToIdle() }
+            }
+        case .idle:
+            cyclesLeft = 0
+        }
+        // Bubbles disabled until proper pixel-art sprites are created.
+        // if let text = state.bubbleText {
+        //     showBubble(text, autohide: state != .alert)
+        // } else {
+        //     hideBubble()
+        // }
+    }
+
+    private func transitionToIdle() {
+        currentState = .idle
+        stateAge = 0
+        cyclesLeft = 0
+        stateTimeoutTimer = nil
+        hideBubble()
+    }
+
+    /// Read the user-assigned session name from ~/.claude/sessions/<pid>.json.
+    private static func readSessionName(sessionId: String) -> String? {
+        let sessionsDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/sessions")
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: sessionsDir,
+            includingPropertiesForKeys: nil
+        ) else { return nil }
+        for file in files where file.pathExtension == "json" {
+            guard
+                let data = try? Data(contentsOf: file),
+                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let sid = obj["sessionId"] as? String,
+                sid == sessionId,
+                let name = obj["name"] as? String,
+                !name.isEmpty
+            else { continue }
+            return name
+        }
+        return nil
+    }
+
+    /// Called by AppDelegate's display link tick when the group's best frame is known.
+    /// Pushes the frame directly without trying to look it up again.
+    func applySharedFrame(_ frame: CGRect) {
+        guard !isClosed, !isHidden else { return }
+        applyFrame(fromTopLeftRect: frame, animated: false)
+    }
+
+    /// Called by AppDelegate's display link tick (single-pet windows only).
     func syncFromCGWindowList() {
         guard !isClosed, !isHidden else { return }
-        guard let frame = AppDelegate.frameFromCGWindowList(windowID: windowID) else { return }
-        applyFrame(fromTopLeftRect: frame)
+        guard let frame = currentTerminalFrame() else { return }
+        applyFrame(fromTopLeftRect: frame, animated: false)
     }
 
     /// Force an immediate reposition without waiting for the display-link tick.
     /// Call after slot/size changes to snap to the correct position right away.
-    func forceSync() {
+    func forceSync(animated: Bool = false) {
         lastTerminalFrame = nil
-        syncFromCGWindowList()
+        guard !isClosed, !isHidden else { return }
+        guard let frame = currentTerminalFrame() else { return }
+        applyFrame(fromTopLeftRect: frame, animated: animated)
+        anchorAboveTerminalIfVisible()
+    }
+
+    /// Returns the terminal window frame, preferring CGWindowList (cheap) and
+    /// falling back to the AX element. The fallback matters for Ghostty: all
+    /// tabs are grouped under one canonical CGWindowID, so background tabs are
+    /// absent from CGWindowList but their AX element always reports the current
+    /// OS window position.
+    private func currentTerminalFrame() -> CGRect? {
+        if let f = AppDelegate.frameFromCGWindowList(windowID: windowID) { return f }
+        return WindowTracker.frame(of: element)
     }
 
     func hide() {
@@ -143,6 +254,7 @@ final class PetOverlay {
         isHidden = true
         infoFadeTimer?.invalidate()
         infoWindow?.orderOut(nil)
+        bubbleWindow?.orderOut(nil)
         window.orderOut(nil)
     }
 
@@ -162,8 +274,15 @@ final class PetOverlay {
         isClosed = true
         animationTimer?.invalidate()
         animationTimer = nil
+        stateTimeoutTimer?.invalidate()
+        stateTimeoutTimer = nil
+        bubbleHideTimer?.invalidate()
+        bubbleHideTimer = nil
         infoFadeTimer?.invalidate()
         infoFadeTimer = nil
+        bubbleWindow?.orderOut(nil)
+        bubbleWindow = nil
+        bubbleLayer = nil
         infoWindow?.orderOut(nil)
         infoWindow = nil
         tracker.stop()
@@ -209,17 +328,13 @@ final class PetOverlay {
         let appName = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "terminal"
 
         var parts: [String] = [appName]
-        // Prefer the session's own cwd over the live AX window title — the
-        // window title reflects whichever tab is currently active, which is
-        // wrong when multiple sessions share a window (e.g. Ghostty tabs).
-        if let cwd = lastCwd, !cwd.isEmpty {
+        if let name = sessionName, !name.isEmpty {
+            parts.append(name)
+        } else if let cwd = lastCwd, !cwd.isEmpty {
             parts.append((cwd as NSString).lastPathComponent)
         } else {
             let title = (WindowTracker.copyAttribute(element, kAXTitleAttribute) as? String) ?? ""
             if !title.isEmpty { parts.append(title) }
-        }
-        if sessionId.count >= 8 {
-            parts.append("session \(sessionId.prefix(8))")
         }
         return parts.joined(separator: " — ")
     }
@@ -264,9 +379,90 @@ final class PetOverlay {
         return label
     }
 
+    // MARK: - Speech bubble
+
+    private func showBubble(_ text: String, autohide: Bool) {
+        bubbleHideTimer?.invalidate()
+        bubbleHideTimer = nil
+
+        guard let (image, size) = BubbleRenderer.render(text: text) else { return }
+
+        let bw = ensureBubbleWindow()
+        let bl = ensureBubbleLayer(in: bw)
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        bl.contents = image
+        bl.frame = CGRect(origin: .zero, size: size)
+        CATransaction.commit()
+
+        positionBubble(size: size)
+        bw.alphaValue = 1
+        if !bw.isVisible { bw.orderFront(nil) }
+
+        if autohide {
+            bubbleHideTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
+                MainActor.assumeIsolated { self?.hideBubble() }
+            }
+        }
+    }
+
+    private func hideBubble() {
+        bubbleHideTimer?.invalidate()
+        bubbleHideTimer = nil
+        guard let bw = bubbleWindow, bw.isVisible else { return }
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.15
+            bw.animator().alphaValue = 0
+        } completionHandler: { [weak bw] in
+            MainActor.assumeIsolated { bw?.orderOut(nil) }
+        }
+    }
+
+    private func positionBubble(size: CGSize) {
+        guard let bw = bubbleWindow else { return }
+        let petFrame = window.frame
+        let origin = NSPoint(
+            x: petFrame.midX - size.width / 2,
+            y: petFrame.maxY + 4
+        )
+        bw.setFrame(NSRect(origin: origin, size: size), display: false)
+    }
+
+    private func ensureBubbleWindow() -> NSWindow {
+        if let w = bubbleWindow { return w }
+        let w = NSWindow(
+            contentRect: .zero,
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false
+        )
+        w.isOpaque = false
+        w.backgroundColor = .clear
+        w.level = .statusBar
+        w.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        w.ignoresMouseEvents = true
+        w.hasShadow = false
+        let cv = NSView(frame: .zero)
+        cv.wantsLayer = true
+        w.contentView = cv
+        bubbleWindow = w
+        return w
+    }
+
+    private func ensureBubbleLayer(in w: NSWindow) -> CALayer {
+        if let l = bubbleLayer { return l }
+        let l = CALayer()
+        l.contentsGravity = .resize
+        l.magnificationFilter = .nearest
+        w.contentView?.layer?.addSublayer(l)
+        bubbleLayer = l
+        return l
+    }
+
     // MARK: - Frame + Z-ordering
 
-    private func applyFrame(fromTopLeftRect rect: CGRect) {
+    private func applyFrame(fromTopLeftRect rect: CGRect, animated: Bool = false) {
         if rect == lastTerminalFrame { return }
         lastTerminalFrame = rect
         let terminalNS = AppDelegate.nsRect(fromAX: rect)
@@ -275,15 +471,37 @@ final class PetOverlay {
             x: terminalNS.maxX - petSize - petInset - xOffset,
             y: terminalNS.maxY - petOverlap
         )
-        window.setFrame(NSRect(origin: origin, size: CGSize(width: petSize, height: petSize)), display: false)
+        let newFrame = NSRect(origin: origin, size: CGSize(width: petSize, height: petSize))
+        if animated {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.22
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                window.animator().setFrame(newFrame, display: true)
+            }
+        } else {
+            window.setFrame(newFrame, display: false)
+        }
+        repositionInfoWindowIfVisible()
+        if let bw = bubbleWindow, bw.isVisible {
+            positionBubble(size: bw.frame.size)
+        }
+    }
+
+    private func repositionInfoWindowIfVisible() {
+        guard let info = infoWindow, info.isVisible else { return }
+        guard let label = infoLabel else { return }
+        let bubbleSize = CGSize(width: label.frame.width + 16, height: label.frame.height + 8)
+        let petFrame = window.frame
+        let bubbleOrigin = NSPoint(
+            x: petFrame.minX - bubbleSize.width - 6,
+            y: petFrame.midY - bubbleSize.height / 2
+        )
+        info.setFrame(NSRect(origin: bubbleOrigin, size: bubbleSize), display: false)
     }
 
     private func anchorAboveTerminalIfVisible() {
         guard !isClosed, !isHidden else { return }
-        if !window.isVisible {
-            window.orderFront(nil)
-        }
-        window.order(.above, relativeTo: Int(windowID))
+        window.orderFront(nil)
     }
 
     private func invalidateLayout() {
@@ -307,13 +525,59 @@ final class PetOverlay {
     }
 
     private func tick() {
-        tickCount += 1
-        let cycle = tickCount % 36
-        let frame = (cycle == 0 || cycle == 1) ? frames[1] : frames[0]
+        // Advance one-shot states and detect cycle completion before rendering.
+        switch currentState {
+        case .celebrate:
+            let cycleLen = 12
+            if stateAge > 0 && stateAge % cycleLen == 0 {
+                if cyclesLeft <= 1 { transitionToIdle() }
+                else { cyclesLeft -= 1 }
+            }
+        case .alert:
+            break // loops until replaced by a new event
+        default:
+            break
+        }
+
+        let frames = sprites[currentState, default: sprites[.idle, default: []]]
+        guard !frames.isEmpty else { stateAge += 1; return }
+
+        let image: CGImage
+        switch currentState {
+        case .idle:
+            // Blink on the last 2 ticks of a 36-tick cycle.
+            let pos = stateAge % 36
+            image = pos >= 34 ? frames[min(1, frames.count - 1)] : frames[0]
+
+        case .listening:
+            // Same timing as idle — slow blink every 36 ticks.
+            let pos = stateAge % 36
+            image = pos >= 34 ? frames[min(1, frames.count - 1)] : frames[0]
+
+        case .working, .writing:
+            // Alternate paw height every 3 ticks.
+            let pos = stateAge % 6
+            image = pos < 3 ? frames[0] : frames[min(1, frames.count - 1)]
+
+        case .celebrate:
+            // squat(2) → jump(3) → peak(4) → land(3) = 12-tick cycle
+            let pos = stateAge % 12
+            let idx = pos < 2 ? 0 : pos < 5 ? 1 : pos < 9 ? 2 : 3
+            image = frames[min(idx, frames.count - 1)]
+
+        case .alert:
+            // wide-eyes(2) → hop(3) → settle(3) = 8-tick cycle
+            let pos = stateAge % 8
+            let idx = pos < 2 ? 0 : pos < 5 ? 1 : 2
+            image = frames[min(idx, frames.count - 1)]
+        }
+
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        contentView.layer?.contents = frame
+        contentView.layer?.contents = image
         CATransaction.commit()
+
+        stateAge += 1
     }
 }
 

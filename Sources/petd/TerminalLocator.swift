@@ -34,8 +34,11 @@ enum TerminalLocator {
                 let windows = ref as? [AXUIElement]
             else { continue }
             for element in windows {
-                let title = (WindowTracker.copyAttribute(element, kAXTitleAttribute) as? String)?.lowercased() ?? ""
-                guard title.contains(needle) else { continue }
+                let title = (WindowTracker.copyAttribute(element, kAXTitleAttribute) as? String) ?? ""
+                // Skip windows whose title is a Claude Code session description
+                // (they begin with "✳" and contain session state, not a shell cwd).
+                guard !title.hasPrefix("✳") else { continue }
+                guard title.lowercased().contains(needle) else { continue }
                 var wid: CGWindowID = 0
                 guard _AXUIElementGetWindow(element, &wid) == .success, wid != 0 else { continue }
                 return Match(pid: pid, element: element, windowID: wid)
@@ -65,6 +68,35 @@ enum TerminalLocator {
             }
         }
         return results
+    }
+
+    /// Finds the terminal window owned by the given pid. Useful for matching
+    /// a running claude process to its parent terminal by walking the process
+    /// parent chain until we hit a known terminal app.
+    static func windowForTerminalPid(_ terminalPid: pid_t) -> Match? {
+        let apps = NSWorkspace.shared.runningApplications.filter {
+            guard let id = $0.bundleIdentifier else { return false }
+            return SupportedTerminal.bundleIds.contains(id) && $0.processIdentifier == terminalPid
+        }
+        guard let app = apps.first else { return nil }
+        let pid = app.processIdentifier
+        let appEl = AXUIElementCreateApplication(pid)
+
+        let candidate: AXUIElement?
+        if let ref = WindowTracker.copyAttribute(appEl, kAXFocusedWindowAttribute),
+           CFGetTypeID(ref) == AXUIElementGetTypeID() {
+            candidate = (ref as! AXUIElement)
+        } else if let ref = WindowTracker.copyAttribute(appEl, kAXWindowsAttribute),
+                  let arr = ref as? [AXUIElement],
+                  let first = arr.first {
+            candidate = first
+        } else {
+            candidate = nil
+        }
+        guard let element = candidate else { return nil }
+        var wid: CGWindowID = 0
+        guard _AXUIElementGetWindow(element, &wid) == .success, wid != 0 else { return nil }
+        return Match(pid: pid, element: element, windowID: wid)
     }
 
     static func focusedTerminalWindow() -> Match? {

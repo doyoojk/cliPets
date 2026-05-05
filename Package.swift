@@ -13,5 +13,9 @@ let package = Package(
             name: "clipets",
             path: "Sources/clipets"
         ),
+        .executableTarget(
+            name: "petdemo",
+            path: "Sources/petdemo"
+        ),
     ]
 )
