@@ -34,6 +34,8 @@ final class PetOverlay {
     private let petGap: CGFloat = 6
     /// How far the paws dip below the terminal's top edge.
     private let petOverlap: CGFloat = 20
+    /// Size used when the terminal is full-screened.
+    private var isFullScreen: Bool = false
 
     let element: AXUIElement
     private let sprites: [PetAnimationState: [CGImage]]
@@ -44,6 +46,8 @@ final class PetOverlay {
     private var lastTerminalFrame: CGRect?
     private var isClosed = false
     private var isHidden = false
+    /// Hidden because the terminal is in a different Space or behind a full-screen app.
+    private var isHiddenBySpace = false
 
     // Animation state machine
     private var currentState: PetAnimationState = .idle
@@ -90,8 +94,8 @@ final class PetOverlay {
         )
         w.isOpaque = false
         w.backgroundColor = .clear
-        w.level = .floating
-        w.collectionBehavior = [.transient, .ignoresCycle]
+        w.level = .normal
+        w.collectionBehavior = [.canJoinAllSpaces, .ignoresCycle]
         w.ignoresMouseEvents = false
         w.hasShadow = false
 
@@ -107,10 +111,13 @@ final class PetOverlay {
         self.contentView = cv
         self.tracker = WindowTracker(pid: pid, element: element, windowID: windowID)
 
-        cv.onClick = { [weak self] in self?.showInfo() }
+        cv.onClick = { [weak self] in self?.toggleInfo() }
 
-        tracker.onFrameChange = { [weak self] axFrame in
-            self?.applyFrame(fromTopLeftRect: axFrame)
+        // onFrameChange only re-anchors Z-order; all positioning is handled by
+        // the 60 fps display link so the AX element's stale windowed frame
+        // never overrides the display link's on-screen frame (important when
+        // the terminal creates a new window for full-screen mode).
+        tracker.onFrameChange = { [weak self] _ in
             self?.anchorAboveTerminalIfVisible()
         }
         tracker.onWindowLost = { [weak self] in
@@ -217,9 +224,11 @@ final class PetOverlay {
 
     /// Called by AppDelegate's display link tick when the group's best frame is known.
     /// Pushes the frame directly without trying to look it up again.
-    func applySharedFrame(_ frame: CGRect) {
-        guard !isClosed, !isHidden else { return }
-        applyFrame(fromTopLeftRect: frame, animated: false)
+    /// `inferredFullScreen` overrides `detectFullScreen` — pass true when the display
+    /// link detected that the terminal created a new Space window (byWID==nil, byPID!=nil).
+    func applySharedFrame(_ frame: CGRect, inferredFullScreen: Bool = false) {
+        guard !isClosed, !isHidden, !isHiddenBySpace else { return }
+        applyFrame(fromTopLeftRect: frame, animated: false, inferredFullScreen: inferredFullScreen)
     }
 
     /// Called by AppDelegate's display link tick (single-pet windows only).
@@ -245,7 +254,7 @@ final class PetOverlay {
     /// absent from CGWindowList but their AX element always reports the current
     /// OS window position.
     private func currentTerminalFrame() -> CGRect? {
-        if let f = AppDelegate.frameFromCGWindowList(windowID: windowID) { return f }
+        if let f = AppDelegate.frameFromCGWindowListAnySpace(windowID: windowID) { return f }
         return WindowTracker.frame(of: element)
     }
 
@@ -263,10 +272,25 @@ final class PetOverlay {
         isHidden = false
         // Force a reposition next sync.
         lastTerminalFrame = nil
-        if let frame = AppDelegate.frameFromCGWindowList(windowID: windowID) {
+        if let frame = AppDelegate.frameFromCGWindowListAnySpace(windowID: windowID) {
             applyFrame(fromTopLeftRect: frame)
         }
         anchorAboveTerminalIfVisible()
+    }
+
+    /// Called by the display link when the terminal is not on the current screen/Space.
+    func hideForSpace() {
+        guard !isClosed, !isHidden, !isHiddenBySpace else { return }
+        isHiddenBySpace = true
+        window.orderOut(nil)
+        bubbleWindow?.orderOut(nil)
+    }
+
+    /// Called by the display link when the terminal becomes visible again.
+    func showIfHiddenBySpace() {
+        guard !isClosed, !isHidden, isHiddenBySpace else { return }
+        isHiddenBySpace = false
+        lastTerminalFrame = nil
     }
 
     func close() {
@@ -291,6 +315,28 @@ final class PetOverlay {
     }
 
     // MARK: - Identification bubble
+
+    private func toggleInfo() {
+        if let w = infoWindow, w.isVisible {
+            infoFadeTimer?.invalidate()
+            infoFadeTimer = nil
+            w.orderOut(nil)
+        } else {
+            logDiagnostics()
+            showInfo()
+        }
+    }
+
+    private func logDiagnostics() {
+        let axFull = WindowTracker.copyAttribute(element, "AXFullscreen") as? Bool
+        let axFrame = WindowTracker.frame(of: element)
+        let cgFrame = AppDelegate.frameFromCGWindowListAnySpace(windowID: windowID)
+        let cgOnScreen = AppDelegate.frameFromCGWindowList(windowID: windowID)
+        let petFrame = window.frame
+        let byPID = AppDelegate.frameForAnyOnscreenWindow(pid: pid)
+        let inferredFS = cgOnScreen == nil && byPID != nil
+        NSLog("cliPets: CLICK DIAG session=\(sessionId.prefix(8)) isFullScreen=\(isFullScreen) inferredFS=\(inferredFS) isHiddenBySpace=\(isHiddenBySpace) axFullscreen=\(axFull.map{"\($0)"} ?? "nil") axFrame=\(axFrame.map{"\(Int($0.width))x\(Int($0.height))"} ?? "nil") cgFrame=\(cgFrame.map{"\(Int($0.width))x\(Int($0.height))"} ?? "nil") cgOnScreen=\(cgOnScreen.map{"\(Int($0.width))x\(Int($0.height))"} ?? "nil") byPID=\(byPID.map{"\(Int($0.width))x\(Int($0.height))"} ?? "nil") petWindow=\(Int(petFrame.width))x\(Int(petFrame.height))@\(Int(petFrame.origin.x)),\(Int(petFrame.origin.y)) screens=\(NSScreen.screens.map{"\(Int($0.frame.width))x\(Int($0.frame.height))"})")
+    }
 
     private func showInfo() {
         let text = identifyingText()
@@ -462,16 +508,52 @@ final class PetOverlay {
 
     // MARK: - Frame + Z-ordering
 
-    private func applyFrame(fromTopLeftRect rect: CGRect, animated: Bool = false) {
-        if rect == lastTerminalFrame { return }
+    /// Uses the AX `AXFullscreen` attribute. Falls back to dimension comparison
+    /// if the attribute is unsupported (some apps don't expose it).
+    private func detectFullScreen(rect: CGRect) -> Bool {
+        if let val = WindowTracker.copyAttribute(element, "AXFullscreen") as? Bool {
+            return val
+        }
+        return NSScreen.screens.contains {
+            abs(rect.width - $0.frame.width) < 40 &&
+            abs(rect.height - $0.frame.height) < 40
+        }
+    }
+
+    private func applyFrame(fromTopLeftRect rect: CGRect, animated: Bool = false, inferredFullScreen: Bool = false) {
+        let nowFullScreen = inferredFullScreen || detectFullScreen(rect: rect)
+        guard rect != lastTerminalFrame || nowFullScreen != isFullScreen else { return }
         lastTerminalFrame = rect
-        let terminalNS = AppDelegate.nsRect(fromAX: rect)
-        let xOffset = CGFloat(slotIndex) * (petSize + petGap)
-        let origin = NSPoint(
-            x: terminalNS.maxX - petSize - petInset - xOffset,
-            y: terminalNS.maxY - petOverlap
-        )
-        let newFrame = NSRect(origin: origin, size: CGSize(width: petSize, height: petSize))
+        isFullScreen = nowFullScreen
+
+        let effectiveSize: CGFloat
+        let origin: NSPoint
+
+        if nowFullScreen {
+            // Bottom-right corner of the screen that contains the terminal, inset 20pt.
+            let screen = NSScreen.screens.first(where: { $0.frame.contains(
+                AppDelegate.nsRect(fromAX: rect).origin
+            ) }) ?? NSScreen.main ?? NSScreen.screens[0]
+            effectiveSize = 36
+            let xOffset = CGFloat(slotIndex) * (effectiveSize + petGap)
+            origin = NSPoint(
+                x: screen.frame.maxX - effectiveSize - 20 - xOffset,
+                y: screen.frame.minY + 20
+            )
+        } else {
+            effectiveSize = petSize
+            let xOffset = CGFloat(slotIndex) * (effectiveSize + petGap)
+            let terminalNS = AppDelegate.nsRect(fromAX: rect)
+            origin = NSPoint(
+                x: terminalNS.maxX - effectiveSize - petInset - xOffset,
+                y: terminalNS.maxY - petOverlap
+            )
+        }
+
+        let newFrame = NSRect(origin: origin, size: CGSize(width: effectiveSize, height: effectiveSize))
+        contentView.frame = NSRect(origin: .zero, size: CGSize(width: effectiveSize, height: effectiveSize))
+        contentView.layer?.frame = contentView.bounds
+
         if animated {
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.22
@@ -481,6 +563,7 @@ final class PetOverlay {
         } else {
             window.setFrame(newFrame, display: false)
         }
+        window.order(.above, relativeTo: Int(windowID))
         repositionInfoWindowIfVisible()
         if let bw = bubbleWindow, bw.isVisible {
             positionBubble(size: bw.frame.size)
@@ -500,8 +583,8 @@ final class PetOverlay {
     }
 
     private func anchorAboveTerminalIfVisible() {
-        guard !isClosed, !isHidden else { return }
-        window.orderFront(nil)
+        guard !isClosed, !isHidden, !isHiddenBySpace else { return }
+        window.order(.above, relativeTo: Int(windowID))
     }
 
     private func invalidateLayout() {
@@ -509,6 +592,7 @@ final class PetOverlay {
     }
 
     private func onPetSizeChanged() {
+        guard !isFullScreen else { return }  // full-screen uses fixed 36pt size
         contentView.frame = NSRect(origin: .zero, size: CGSize(width: petSize, height: petSize))
         contentView.layer?.frame = contentView.bounds
         invalidateLayout()

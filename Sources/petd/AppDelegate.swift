@@ -29,12 +29,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let granted = ensureAccessibilityPermission(prompt: true)
+        NSLog("cliPets: AX trusted=\(granted) bundleId=\(Bundle.main.bundleIdentifier ?? "nil") bundlePath=\(Bundle.main.bundlePath)")
         buildVariantSprites()
         startFrameSync()
         startEventServer()
         startPawMenu()
-        if granted {
-            adoptRecentSessions()
+        // Always try to adopt sessions; individual AX calls fail gracefully if not trusted.
+        adoptRecentSessions()
+        if !granted {
+            // Re-check every 2 s until permission is granted, then do a one-shot adoption.
+            schedulePermissionRetry()
+        }
+    }
+
+    private func schedulePermissionRetry() {
+        Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            if ensureAccessibilityPermission(prompt: false) {
+                NSLog("cliPets: AX permission now granted — retrying session adoption")
+                timer.invalidate()
+                MainActor.assumeIsolated { self.adoptRecentSessions() }
+            }
         }
     }
 
@@ -258,20 +273,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // For a new session, the focused terminal window is the most reliable
-        // binding: SessionStart fires the instant the user runs `claude`, so
-        // they are almost always looking at the right window. Fall back to
-        // cwd-title match if focus has already shifted away.
-        var match: TerminalLocator.Match?
-        if let m = TerminalLocator.focusedTerminalWindow() {
-            NSLog("cliPets: bound new session \(sessionId.prefix(8)) to focused terminal")
-            match = m
-        } else if let cwd = event.cwd, let m = TerminalLocator.windowMatchingCwd(cwd) {
-            NSLog("cliPets: bound new session \(sessionId.prefix(8)) by cwd match (\(cwd))")
-            match = m
-        }
-        guard let match else {
-            NSLog("cliPets: no terminal window matched for session \(sessionId.prefix(8))")
+        // Try to find the exact terminal window for this session by scanning running
+        // claude processes and matching via parent-PID chain. Falls back to
+        // CWD title match, then focused terminal.
+        guard let match = findTerminalForSession(sessionId, cwd: event.cwd) else {
+            NSLog("cliPets: no terminal window matched for session \(sessionId.prefix(8)) (AX trusted=\(AXIsProcessTrusted()))")
             return
         }
 
@@ -282,6 +288,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             windowID: match.windowID,
             event: event
         )
+    }
+
+    /// Find the terminal window that owns `sessionId` by scanning running claude
+    /// processes. Primary: walk parent-PID chain from the claude process to the
+    /// terminal. Secondary: CWD title match. Tertiary: focused terminal.
+    private func findTerminalForSession(_ sessionId: String, cwd: String?) -> TerminalLocator.Match? {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser.path
+        let projectsRoot = URL(fileURLWithPath: "\(home)/.claude/projects")
+
+        for (claudePid, pidCwd) in runningClaudePidCwds() {
+            let encoded = Self.encodeProjectDirName(cwd: pidCwd)
+            let sessionFile = projectsRoot
+                .appendingPathComponent(encoded)
+                .appendingPathComponent("\(sessionId).jsonl")
+            guard fm.fileExists(atPath: sessionFile.path) else { continue }
+
+            if let termPid = terminalPidForProcess(claudePid),
+               let m = TerminalLocator.windowForTerminalPid(termPid) {
+                NSLog("cliPets: bound new session \(sessionId.prefix(8)) to terminal via process walk (claude pid \(claudePid))")
+                return m
+            }
+        }
+
+        if let cwd, let m = TerminalLocator.windowMatchingCwd(cwd) {
+            NSLog("cliPets: bound new session \(sessionId.prefix(8)) by cwd match (\(cwd))")
+            return m
+        }
+
+        if let m = TerminalLocator.focusedTerminalWindow() {
+            NSLog("cliPets: bound new session \(sessionId.prefix(8)) to focused terminal (fallback)")
+            return m
+        }
+
+        return nil
     }
 
     private func spawnOverlay(
@@ -406,9 +447,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 3. AX direct query — accurate at rest but stale during a drag; kept as
     ///    a last resort so pets at least snap into place after the drag ends.
     private func bestFrame(forGroupID groupID: CGWindowID) -> CGRect? {
-        // let shouldLog = debugLogTick % 60 == 0
-        if let f = Self.frameFromCGWindowList(windowID: groupID) {
-            // if shouldLog { NSLog("cliPets: bestFrame group=\(groupID) source=CGWindowList frame=\(f)") }
+        if let f = Self.frameFromCGWindowListAnySpace(windowID: groupID) {
             return f
         }
         guard let sessions = sessionsByWindow[groupID], !sessions.isEmpty else { return nil }
@@ -485,19 +524,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            // Find one good frame for the whole group and push it to every pet.
-            // CGWindowList only contains the active Ghostty tab; for background
-            // tabs we fall back to an AX direct query on whichever element works.
-            guard let frame = bestFrame(forGroupID: groupID) else { continue }
+            // terminalOnScreen: true only if the terminal window is visible in
+            // the current Space. If we can only get the frame via AX (not
+            // CGWindowList), the terminal is in a different Space or hidden —
+            // hide the pet so it doesn't float over unrelated full-screen apps.
+            let terminalPid = overlays[sessions[0]]?.pid
+            let byWID = Self.frameFromCGWindowList(windowID: groupID)
+            let byPID = terminalPid.flatMap { Self.frameForAnyOnscreenWindow(pid: $0) }
+            let onScreenFrame = byWID ?? byPID
+            let terminalOnScreen = onScreenFrame != nil
+            // byWID==nil + byPID!=nil means the tracked window left the current Space
+            // (Ghostty creates a new window for full-screen); treat as full-screen.
+            let inferredFullScreen = byWID == nil && byPID != nil
+
+            // Fall back to AX only for positioning, not for showing pets.
+            let axFrame = sessions.lazy
+                .compactMap { self.overlays[$0].flatMap { WindowTracker.frame(of: $0.element) } }
+                .first
+            guard let frame = onScreenFrame ?? axFrame else { continue }
+
             for sid in sessions {
-                overlays[sid]?.applySharedFrame(frame)
+                guard let overlay = overlays[sid] else { continue }
+                if terminalOnScreen {
+                    overlay.showIfHiddenBySpace()
+                } else {
+                    overlay.hideForSpace()
+                }
+                if terminalOnScreen {
+                    overlay.applySharedFrame(frame, inferredFullScreen: inferredFullScreen)
+                }
             }
         }
     }
 
     // MARK: - Static helpers (used by PetOverlay)
 
+    /// Returns the on-screen frame of the given window, or nil if the window
+    /// is not visible on the current Space.
     static func frameFromCGWindowList(windowID: CGWindowID) -> CGRect? {
+        guard let list = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else { return nil }
+        for entry in list {
+            guard
+                let wid = entry[kCGWindowNumber as String] as? CGWindowID,
+                wid == windowID,
+                let boundsCF = entry[kCGWindowBounds as String]
+            else { continue }
+            var rect = CGRect.zero
+            guard CGRectMakeWithDictionaryRepresentation(boundsCF as! CFDictionary, &rect) else { continue }
+            return rect
+        }
+        return nil
+    }
+
+    /// Returns the frame of the given window regardless of which Space it is on.
+    /// Used only for positioning when the window is confirmed to be on-screen.
+    static func frameFromCGWindowListAnySpace(windowID: CGWindowID) -> CGRect? {
         let opts: CGWindowListOption = .optionIncludingWindow
         guard
             let info = CGWindowListCopyWindowInfo(opts, windowID) as? [[String: Any]],
@@ -505,9 +589,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let boundsCF = dict[kCGWindowBounds as String] as CFTypeRef?
         else { return nil }
         var rect = CGRect.zero
-        guard CGRectMakeWithDictionaryRepresentation(boundsCF as! CFDictionary, &rect) else {
-            return nil
-        }
+        guard CGRectMakeWithDictionaryRepresentation(boundsCF as! CFDictionary, &rect) else { return nil }
         return rect
     }
 

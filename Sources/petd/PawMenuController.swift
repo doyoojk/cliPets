@@ -23,8 +23,8 @@ final class PawMenuController: NSObject {
         )
         w.isOpaque = false
         w.backgroundColor = .clear
-        w.level = .floating
-        w.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        w.level = .normal
+        w.collectionBehavior = [.moveToActiveSpace, .ignoresCycle]
         w.hasShadow = false
         pawWindow = w
         super.init()
@@ -36,11 +36,13 @@ final class PawMenuController: NSObject {
         view.onDragged      = { [weak self] newOrigin in
             guard let self else { return }
             self.pawWindow.setFrameOrigin(newOrigin)
+            if let p = self.panel, p.isVisible { self.positionPanel() }
+        }
+        view.onDragEnded    = { newOrigin in
             UserDefaults.standard.set(
                 [Double(newOrigin.x), Double(newOrigin.y)],
                 forKey: "pawWindowOrigin"
             )
-            if let p = self.panel, p.isVisible { self.positionPanel() }
         }
         w.contentView = view
 
@@ -179,8 +181,9 @@ private final class PawView: NSView {
     var onRightClick: ((NSEvent) -> Void)?
     var onCmdClick: (() -> Void)?
     var onDragged: ((NSPoint) -> Void)?
+    var onDragEnded: ((NSPoint) -> Void)?
 
-    private var mouseDownLoc: NSPoint?
+    private var mouseDownScreenLoc: NSPoint?
     private var windowOriginAtDown: NSPoint?
 
     private static let pawImage: NSImage? = {
@@ -198,22 +201,27 @@ private final class PawView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         if event.modifierFlags.contains(.command) { onCmdClick?(); return }
-        mouseDownLoc = event.locationInWindow
+        mouseDownScreenLoc = NSEvent.mouseLocation
         windowOriginAtDown = window?.frame.origin
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard let start = mouseDownLoc, let origin = windowOriginAtDown else { return }
-        let d = NSPoint(x: event.locationInWindow.x - start.x, y: event.locationInWindow.y - start.y)
-        onDragged?(NSPoint(x: origin.x + d.x, y: origin.y + d.y))
+        guard let start = mouseDownScreenLoc, let origin = windowOriginAtDown else { return }
+        let cur = NSEvent.mouseLocation
+        onDragged?(NSPoint(x: origin.x + cur.x - start.x, y: origin.y + cur.y - start.y))
     }
 
     override func mouseUp(with event: NSEvent) {
-        guard let start = mouseDownLoc else { return }
-        defer { mouseDownLoc = nil; windowOriginAtDown = nil }
-        let loc = event.locationInWindow
-        let dist = hypot(loc.x - start.x, loc.y - start.y)
-        if dist < 3 { onSingleClick?() }
+        guard let start = mouseDownScreenLoc else { return }
+        let cur = NSEvent.mouseLocation
+        let dist = hypot(cur.x - start.x, cur.y - start.y)
+        if dist < 3 {
+            onSingleClick?()
+        } else if let origin = window?.frame.origin {
+            onDragEnded?(origin)
+        }
+        mouseDownScreenLoc = nil
+        windowOriginAtDown = nil
     }
 
     override func rightMouseDown(with event: NSEvent) { onRightClick?(event) }
