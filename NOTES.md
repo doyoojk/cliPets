@@ -74,6 +74,24 @@ Add dog, capybara, duck, bunny, bear, penguin, pig to `PetCatalog` once
 sprite sheets exist. Each species needs its own `SpriteBuilder` drawing
 functions (or a sprite-sheet loader to replace the procedural renderer).
 
+### Drag pet between terminal windows (v2 extension)
+
+Let users drag a pet from one terminal window and drop it onto another to
+rebind the session. Estimated effort: ~1 day.
+
+Implementation sketch:
+- On `mouseDown` in `PetContentView`, detach the pet from its terminal
+  (remove from `sessionsByWindow`, relayout the old window) and enter a
+  free-floating drag mode.
+- During `mouseDragged`, move the pet window freely with the cursor.
+- On `mouseUp`, temporarily set `ignoresMouseEvents = true` on the pet
+  window so it doesn't block the hit-test, then scan `CGWindowListCopyWindowInfo`
+  for the topmost supported-terminal window under the drop point using
+  `TerminalLocator`. Re-bind the pet to that window (`windowID`, `element`,
+  `pid`) and call `relayoutPets` on both the old and new windows.
+- If dropped on a non-terminal area, snap back to the original window with
+  a brief animation.
+
 ### Collection UI in paw menu (Phase 8 extension)
 
 The paw menu panel has a "Collection coming in Phase 7" placeholder. Replace
